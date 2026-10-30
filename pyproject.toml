@@ -1,0 +1,214 @@
+[build-system]
+requires = ["setuptools>=77", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+# Distribution name on PyPI. The *import* package and the console
+# script are both still `atrium` — only the PyPI project name differs.
+#
+# Why: "atrium" is taken on PyPI (an unrelated "MX API" package, v2.11.7
+# with 18 releases as of 2026-10-22). Publishing under it is
+# impossible, and `pip install atrium` in the wild installs somebody
+# else's package. `atrium-rag` was free at the time of writing and
+# says what the thing does. If you fork this, pick your own name —
+# the import path and CLI name are independent of it.
+name = "atrium-rag"
+version = "0.2.0"
+description = "Atrium — universal RAG ingestion: parse, chunk, embed, and retrieve across PDF, Office, HTML, and Markdown. The gathering hall for your documents."
+readme = "README.md"
+requires-python = ">=3.10"
+license = "MIT"
+license-files = ["LICENSE"]
+authors = [
+    { name = "Atrium contributors" },
+]
+keywords = [
+    "atrium",
+    "rag",
+    "retrieval-augmented-generation",
+    "ingestion",
+    "pdf",
+    "embeddings",
+    "vector-database",
+    "qdrant",
+    "pgvector",
+]
+classifiers = [
+    "Development Status :: 4 - Beta",
+    "Intended Audience :: Developers",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.10",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Topic :: Scientific/Engineering :: Artificial Intelligence",
+]
+
+# Core dependencies — required for any install.
+# Pin lower bounds only; upper bounds stay loose to allow security
+# patches without re-releasing.
+dependencies = [
+    "fastapi>=0.115.0",
+    "uvicorn>=0.30.0",
+    # python-multipart 0.0.18+ fixes multiple CVEs (PYSEC-2026-1851,
+    # -1852, -3036 through -3040) affecting the multipart parser
+    # FastAPI uses for file uploads. Stay >= 0.0.18.
+    "python-multipart>=0.0.18",
+    "pydantic>=2.9.0",
+    # PDF parsing: pdfplumber (MIT) over pdfminer.six (MIT), with
+    # PDFium (BSD-3) for page rendering. Permissively licensed, so the
+    # whole distribution stays MIT.
+    "pdfplumber>=0.11.0",
+    "pypdfium2>=4.0.0",
+    "python-magic>=0.4.27",
+    "httpx>=0.27.0",
+    "qdrant-client>=1.11.0",
+    "psycopg[binary,pool]>=3.2.0",
+    "pgvector>=0.3.0",
+    "python-docx>=1.1.0",
+    "python-pptx>=1.0.0",
+    "openpyxl>=3.1.0",
+    "beautifulsoup4>=4.12.0",
+    "typer>=0.12.0",
+    # click is imported directly by atrium/cli.py (click.Choice, click.BOOL).
+    # typer 0.26+ no longer pins click as a hard dep — declare it here.
+    "click>=8.0",
+    "tenacity>=9.0.0",
+    # starlette 0.40+ fixes multiple CVEs (PYSEC-2026-161, -1941,
+    # -1943, -2280, -2281, -248, -249). Pulled in transitively by
+    # FastAPI; the lower bound here documents the requirement for
+    # tools that resolve deps from this metadata directly.
+    "starlette>=0.40.0",
+    # Format coverage: pure-Python parsers for text/markdown/csv/json,
+    # RTF, legacy XLS, and OpenDocument.
+    "striprtf>=0.0.26",
+    "xlrd>=1.2.0,<2.0",   # 2.0+ dropped .xls support
+    "odfpy>=1.4.0",
+]
+
+[project.optional-dependencies]
+# Vision: Ollama vision adapter (minicpm-v / llava). Already required
+# for image documents; bundled as an extra so dev installs without a
+# local Ollama stay slim.
+vision = [
+    # No extra deps today — the adapter talks to Ollama via httpx.
+    # The extra exists so `pip install atrium[vision]` is the
+    # documented install path for image-aware setups.
+]
+
+# OCR: Tesseract + RapidOCR support for scanned pages and image-only
+# documents. Tesseract also needs the system binary (see README).
+ocr = [
+    "pytesseract>=0.3.10",
+    "rapidocr-onnxruntime>=1.4.0",
+]
+
+# Rerank: cross-encoder reranker support for /search and
+# retrieve_and_rerank. Adds ~300MB-1.3GB of model weights on first
+# download (cached under ~/.cache/huggingface).
+rerank = [
+    "sentence-transformers>=2.5.0",
+]
+
+# Faster PDF backend: PyMuPDF.
+#
+# PyMuPDF is AGPL-3.0. It is faster than the default pdfplumber
+# backend — pdfminer.six is pure Python — but it carries a copyleft
+# obligation, so it is opt-in rather than a dependency:
+#
+#     pip install "atrium-rag[fast-pdf]"
+#     ATRIUM_PDF_BACKEND=pymupdf
+#
+# Atrium itself is MIT and stays MIT either way. What the AGPL covers
+# is PyMuPDF, which you are choosing to install.
+fast-pdf = [
+    "pymupdf>=1.24.0",
+]
+
+# Alt parsers: heavier PDF parsers as an alternative to the
+# pdfplumber/heuristics default. Docling ships ~2GB of models.
+alt-parsers = [
+    "docling-slim[format-pdf,models-local]>=2.0.0",
+]
+
+# Lightweight ONNX reranker (~30MB, ~120MB RAM). Alternative to the
+# BGE cross-encoder in `rerank`. Used by the FlashRank adapter when
+# RERANK_PROVIDER=flashrank.
+flashrank = [
+    "flashrank>=0.2.10",
+]
+
+# Dev / test / lint / type-check.
+dev = [
+    "pytest>=8.0",
+    "pytest-asyncio>=0.23",
+    "ruff>=0.6",
+    "mypy>=1.10",
+    # Two test files build synthetic PDFs with fitz. The product itself
+    # does not need PyMuPDF — the default backend is pdfplumber.
+    "pymupdf>=1.24.0",
+]
+
+[project.urls]
+# PyPI renders these as the "Homepage", "Documentation" and "Issues"
+# links on the project page.
+Homepage = "https://github.com/ItsMeYash777/atrium-rag"
+Documentation = "https://github.com/ItsMeYash777/atrium-rag/blob/main/README.md"
+Issues = "https://github.com/ItsMeYash777/atrium-rag/issues"
+
+[project.scripts]
+# `atrium` — primary CLI entry point. Subcommands: init,
+# configure, validate, doctor, serve, ingest, retrieve.
+atrium = "atrium.cli:app"
+
+[tool.setuptools]
+packages = ["atrium"]
+
+[tool.setuptools.package-data]
+# Non-Python assets that ship inside the wheel. Pulled in by
+# MANIFEST.in too; both keep the wheel self-contained.
+atrium = ["py.typed"]
+
+[tool.ruff]
+line-length = 100
+target-version = "py310"
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "B", "UP"]
+ignore = [
+    "E501",  # line length (we configure ruff to flag, but allow)
+    "B008",  # function-call-in-default-arg (FastAPI uses this idiom)
+    # The codebase uses `typing.List` / `typing.Optional` consistently
+    # rather than the PEP 585/604 builtins. That is a deliberate
+    # readability choice for a 3.10 floor, not an oversight.
+    "UP006", "UP035", "UP045", "UP037",
+    # `def f(): return x` on one line is the house style in the
+    # adapters module.
+    "E701",
+    # Single-letter names (`l` for a bbox corner) are used in the PDF
+    # parser's geometry helpers, where the short name matches the maths.
+    "E741",
+    # Closures over a loop variable: the callbacks in
+    # universal_parser's PDF block loop are defined and invoked inside
+    # the same iteration, so the late binding never bites.
+    "B023",
+    # `zip(..., strict=)`: adding the argument changes runtime
+    # behaviour on ragged input (raises instead of truncating), which
+    # is a semantic change, not a lint fix.
+    "B905",
+    # Module-level imports that are not at the top of the file: the
+    # lazy-import placement (and the `from atrium.mime import ...`
+    # block in main.py) is deliberate.
+    "E402",
+]
+
+[tool.ruff.lint.isort]
+# Keep aliased imports in one statement. Ruff's default splits
+# `from x import a as b` into seven separate statements, which turns
+# the backwards-compatibility re-export block in main.py into noise.
+combine-as-imports = true
+
+[tool.mypy]
+python_version = "3.10"
+ignore_missing_imports = true
+strict_optional = true
+warn_unused_ignores = true

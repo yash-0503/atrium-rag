@@ -1,0 +1,84 @@
+name: Release
+
+# Tag a release to publish it:
+#
+#     git tag v0.3.0 && git push origin v0.3.0
+#
+# The workflow builds the sdist + wheel, checks the metadata, publishes
+# to PyPI, and creates the GitHub release.
+#
+# PyPI publishing uses a token (`PYPI_API_TOKEN`, a repository secret).
+# If you prefer trusted publishing (no long-lived token), replace the
+# twine step with `pypa/gh-action-pypi-publish` and add
+# `permissions: {id-token: write}` — the package must be registered
+# for trusted publishing on PyPI first.
+
+on:
+  push:
+    tags: ["v*"]
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: "Tag to release (e.g. v0.3.0)"
+        required: true
+
+permissions:
+  contents: read
+
+jobs:
+  publish:
+    name: Publish to PyPI
+    runs-on: ubuntu-latest
+    environment: pypi
+    permissions:
+      contents: write  # for the GitHub release step
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event.inputs.tag || github.ref }}
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install build tooling
+        run: pip install build twine
+
+      - name: Build
+        run: python -m build
+
+      - name: Check the metadata
+        run: twine check dist/*
+
+      - name: Verify the version matches the tag
+        env:
+          TAG: ${{ github.event.inputs.tag || github.ref_name }}
+        run: |
+          python - <<'PY'
+          import os, re, sys, pathlib
+          tag = os.environ["TAG"]
+          version = re.search(
+              r'^version = "([^"]+)"', pathlib.Path("pyproject.toml").read_text(), re.M
+          ).group(1)
+          if not tag.startswith("v" + version):
+              sys.exit(
+                  f"tag {tag} does not match pyproject version {version}"
+              )
+          print(f"tag {tag} matches version {version}")
+          PY
+
+      - name: Publish
+        env:
+          TWINE_USERNAME: __token__
+          TWINE_PASSWORD: ${{ secrets.PYPI_API_TOKEN }}
+        run: twine upload dist/*
+
+      - name: Create the GitHub release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ github.event.inputs.tag || github.ref_name }}
+          generate_release_notes: true
+      - uses: actions/upload-artifact@v4
+        with:
+          name: dist
+          path: dist/

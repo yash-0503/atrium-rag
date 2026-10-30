@@ -1,0 +1,86 @@
+# Atrium — local stack.
+#
+#   docker compose --profile qdrant up -d      # Qdrant + API + worker
+#   docker compose --profile pgvector up -d    # Postgres + pgvector + API + worker
+#
+# The API and the worker share one job queue (a SQLite file on the
+# `atrium-data` volume). Run as many workers as you like: they claim
+# jobs atomically, so no document is processed twice.
+#
+# `.env.docker` holds the container-side configuration — service
+# hostnames, not the hostnames on your laptop. Your own `.env` is for
+# running atrium directly on the host.
+
+x-atrium-common: &atrium-common
+  build:
+    context: .
+  env_file:
+    - .env.docker
+  volumes:
+    - atrium-data:/data
+
+services:
+  api:
+    <<: *atrium-common
+    ports:
+      - "8000:8000"
+    profiles: ["qdrant", "pgvector"] # Runs in both profiles
+    healthcheck:
+      test: ["CMD", "python", "-m", "atrium.healthcheck"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 15s
+
+  # The async ingestion worker. `POST /jobs` enqueues; a worker
+  # claims and processes. Scale with:
+  #   docker compose --profile qdrant up -d --scale worker=3
+  worker:
+    <<: *atrium-common
+    command: ["python", "-m", "atrium.worker"]
+    profiles: ["qdrant", "pgvector"]
+    depends_on:
+      api:
+        condition: service_healthy
+    # The worker has no HTTP surface, so it gets no healthcheck; the
+    # API's healthcheck covers the shared queue's liveness.
+
+  qdrant:
+    image: qdrant/qdrant:latest
+    ports: ["6333:6333"]
+    profiles: ["qdrant"]
+    volumes:
+      - qdrant-data:/qdrant/storage
+    healthcheck:
+      test:
+        - CMD
+        - /bin/sh
+        - -c
+        - >-
+          exec 3<>/dev/tcp/127.0.0.1/6333
+          && echo -e "GET /healthz HTTP/1.0\r\n\r\n" >&3
+          && grep -q "200 OK" <&3
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+  pgvector:
+    image: ankane/pgvector:latest
+    environment:
+      POSTGRES_USER: user
+      POSTGRES_PASSWORD: pass
+      POSTGRES_DB: db
+    ports: ["5432:5432"]
+    profiles: ["pgvector"]
+    volumes:
+      - pg-data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U user -d db"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+volumes:
+  atrium-data:
+  qdrant-data:
+  pg-data:

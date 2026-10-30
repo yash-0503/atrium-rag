@@ -1,0 +1,49 @@
+{
+    "type": "standard",
+    "title": "Transformer (deep learning)",
+    "displaytitle": "<span lang=\"en\" dir=\"ltr\"><span class=\"mw-page-title-main\">Transformer (deep learning)</span></span>",
+    "namespace": {
+        "id": 0,
+        "text": ""
+    },
+    "wikibase_item": "Q85810444",
+    "titles": {
+        "canonical": "Transformer_(deep_learning)",
+        "normalized": "Transformer (deep learning)",
+        "display": "<span lang=\"en\" dir=\"ltr\"><span class=\"mw-page-title-main\">Transformer (deep learning)</span></span>"
+    },
+    "pageid": 61603971,
+    "thumbnail": {
+        "source": "https://thumb.wikimedia.org/wikipedia/commons/thumb/3/34/Transformer%2C_full_architecture.png/330px-Transformer%2C_full_architecture.png?utm_source=en.wikipedia.org&utm_campaign=api&utm_content=thumbnail",
+        "width": 330,
+        "height": 347
+    },
+    "originalimage": {
+        "source": "https://upload.wikimedia.org/wikipedia/commons/3/34/Transformer%2C_full_architecture.png?utm_source=en.wikipedia.org&utm_campaign=api&utm_content=thumbnail_unscaled",
+        "width": 1426,
+        "height": 1500
+    },
+    "lang": "en",
+    "dir": "ltr",
+    "revision": "1379269363",
+    "tid": "f25c82b1-c373-11f1-bfbd-5e673edc9926",
+    "timestamp": "2026-10-08T23:56:58Z",
+    "description": "Algorithm for modelling sequential data",
+    "description_source": "local",
+    "content_urls": {
+        "desktop": {
+            "page": "https://en.wikipedia.org/wiki/Transformer_(deep_learning)",
+            "revisions": "https://en.wikipedia.org/wiki/Transformer_(deep_learning)?action=history",
+            "edit": "https://en.wikipedia.org/wiki/Transformer_(deep_learning)?action=edit",
+            "talk": "https://en.wikipedia.org/wiki/Talk:Transformer_(deep_learning)"
+        },
+        "mobile": {
+            "page": "https://en.wikipedia.org/wiki/Transformer_(deep_learning)",
+            "revisions": "https://en.wikipedia.org/wiki/Special:History/Transformer_(deep_learning)",
+            "edit": "https://en.wikipedia.org/wiki/Transformer_(deep_learning)?action=edit",
+            "talk": "https://en.wikipedia.org/wiki/Talk:Transformer_(deep_learning)"
+        }
+    },
+    "extract": "In deep learning, the transformer is a family of artificial neural network architectures based on the multi-head attention mechanism, in which input data such as text, images, or audio is converted to a sequence of numerical representations called tokens, and each token is converted into a vector through an embedding layer. At each layer, each token is then contextualized within the scope of the context window with other (unmasked) tokens via a parallel multi-head attention mechanism, allowing the signal for key tokens to be amplified and less important tokens to be diminished. Because self-attention alone is permutation-invariant, transformers inject positional information, typically through positional encodings or learned positional embeddings, so token order can affect the output.",
+    "extract_html": "<p>In deep learning, the <b>transformer</b> is a family of artificial neural network architectures based on the multi-head attention mechanism, in which input data such as text, images, or audio is converted to a sequence of numerical representations called tokens, and each token is converted into a vector through an embedding layer. At each layer, each token is then contextualized within the scope of the context window with other (unmasked) tokens via a parallel multi-head attention mechanism, allowing the signal for key tokens to be amplified and less important tokens to be diminished. Because self-attention alone is permutation-invariant, transformers inject positional information, typically through positional encodings or learned positional embeddings, so token order can affect the output.</p>"
+}

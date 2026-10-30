@@ -1,0 +1,36 @@
+# Files to include in the source distribution (sdist) but not
+# covered by setuptools' defaults.
+
+# README + LICENSE.
+include README.md
+include LICENSE
+
+# Operational files referenced in the docs.
+include Dockerfile
+include docker-compose.yml
+include Makefile
+include .env.example
+include .env.docker
+
+# Type marker so mypy/PEP 561 understands the package.
+include atrium/py.typed
+
+# Exclude dev/test/build artifacts from sdist.
+exclude .github
+prune tests
+exclude scripts
+exclude docs
+exclude .venv
+exclude venv
+exclude __pycache__
+exclude .pytest_cache
+exclude .mypy_cache
+exclude .ruff_cache
+exclude .git
+exclude .gitignore
+exclude .dockerignore
+exclude .DS_Store
+exclude *.pyc
+exclude *.pyo
+recursive-exclude * __pycache__
+recursive-exclude * *.pyc

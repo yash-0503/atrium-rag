@@ -1,0 +1,9 @@
+{
+  "name": "S&P 500 Index Constituents (datasets/s-and-p-500-companies)",
+  "format": "csv",
+  "_source": "https://raw.githubusercontent.com/datasets/s-and-p-500-companies/main/data/constituents.csv",
+  "_license": "Public Domain Dedication (CC0 1.0) — datasets/s-and-p-500-companies repository",
+  "expected_element_types": ["heading", "table"],
+  "min_chunks": 1,
+  "_note": "Real finance CSV with ~500 rows. Has quoted fields containing commas ('Saint Paul, Minnesota'), mixed date formats, multi-word entries with embedded commas. Tests the CSV parser's handling of edge cases that the `csv` stdlib module would handle correctly but a naive split() would mangle."
+}

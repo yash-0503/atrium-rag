@@ -1,0 +1,32 @@
+# Keep the build context small and the image reproducible.
+.git
+.github
+.claude
+.venv
+venv
+.venv-bench
+.venv-competitors
+__pycache__
+*.pyc
+*.pyo
+*.egg-info
+.pytest_cache
+.mypy_cache
+.ruff_cache
+build
+dist
+
+# Runtime state and local configuration — never bake these in.
+.env
+.env.docker
+jobs.db
+*.db
+
+# Not needed to build or run the package.
+tests
+benchmark
+docs
+scripts
+sdk
+*.md
+!README.md

@@ -1,0 +1,175 @@
+# ---------- Python ----------
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+build/
+develop-eggs/
+dist/
+downloads/
+eggs/
+.eggs/
+lib/
+lib64/
+parts/
+sdist/
+var/
+wheels/
+*.egg-info/
+.installed.cfg
+*.egg
+MANIFEST
+
+# ---------- Virtual environments ----------
+venv/
+.venv/
+.venv-bench/
+.venv-competitors/
+env/
+ENV/
+env.bak/
+venv.bak/
+
+# ---------- Environment / secrets ----------
+.env
+.env.local
+.env.*.local
+*.pem
+*.key
+
+# ---------- IDE / editor ----------
+.idea/
+.vscode/
+*.swp
+*.swo
+.DS_Store
+Thumbs.db
+
+# ---------- Test / coverage ----------
+.pytest_cache/
+.coverage
+.coverage.*
+htmlcov/
+.tox/
+.nox/
+.mypy_cache/
+.ruff_cache/
+coverage.xml
+
+# ---------- Logs ----------
+*.log
+logs/
+
+# ---------- Docker / build artifacts ----------
+*.tar
+*.tar.gz
+
+# ---------- Project-specific ----------
+# Drop the local venv/scratch dir used during early dev
+/app/__pycache__/
+/tests/__pycache__/
+/sdk/__pycache__/
+
+# Runtime SQLite (job queue lives in jobs.db, regenerable)
+/jobs.db
+/jobs.db-*
+*.sqlite
+*.sqlite-journal
+*.db
+*.db-journal
+!*.example.db
+
+# Local Qdrant data (in case user runs it as a process, not container)
+/qdrant_storage/
+*.qdrant
+
+# Claude Code session/settings (regenerable, machine-specific)
+/.claude/
+
+# Regenerable knowledge graph
+/graphify-out/
+
+# Raw benchmark JSON dumps (timestamped, one per run — keep the curated
+# reports at benchmark/RESULTS.md and tests/benchmarks/BASELINE.md instead)
+/tests/benchmarks/results/*.json
+/tests/benchmarks/results/**/*.json
+/benchmark/results/competitor_*.json
+/benchmark/results/our_*.json
+!/tests/benchmarks/results/.gitkeep
+!/benchmark/results/.gitkeep
+# ...except the headline run: it is the evidence behind the R@8 = 0.8976
+# claim in the README, and it is what scripts/render_benchmark_shot.py
+# renders the README screenshot from. ~90 KB of numbers, no documents.
+!/tests/benchmarks/results/v0_k8.json
+
+# ---------- Benchmark corpus (not in git) ----------
+#
+# The fixture corpus is ~49 MB of third-party documents — an Apple
+# 10-K, an IRS W-2 form, arXiv papers, Wikipedia articles, a 32 MB
+# scanned Arabic PDF. It is not committed:
+#
+#   * redistribution rights differ per document (the Wikipedia files
+#     are CC-BY-SA and need attribution; the US-government ones are
+#     public domain; the arXiv ones carry arXiv's non-exclusive
+#     license), and tests/benchmarks/fixtures/README.md says to avoid
+#     anything whose license does not permit redistribution "if you
+#     intend to commit it";
+#   * 49 MB of binaries in every clone of a library is a bad trade.
+#
+# The corpus is added to the repository separately once the provenance
+# and attribution for every document are settled. Until then the
+# parser benchmark and the fixture-dependent unit tests skip, and CI
+# says so out loud rather than passing quietly.
+#
+# Ground truth (the queries and the expected pages) is small and
+# reviewable — that is what actually belongs in the repository, and it
+# lives in each fixture's ground_truth.json.
+/tests/benchmarks/fixtures/
+/tests/benchmarks/external_pdfs/
+
+# ---------- Local scratch ----------
+#
+# One-off analysis scripts written during audits. They are throwaway
+# copies of work that is not part of the library.
+/analyze_gate_diff.py
+/audit_diagnose.py
+/audit_diff.py
+/audit_golden.py
+/audit_planted.py
+/audit_report_section.py
+/cross_tab.py
+/diagnose_parser.py
+/investigate_bm25_no_evidence.py
+/investigate_deep.py
+/w2_dense_dump.py
+/w2_step4_validate.py
+
+# ---------- Reference material (kept on disk, not in the repo) ----------
+#
+# The library repository ships the package, its tests and its docs.
+# Everything below is the working material behind it — plans, audit
+# reports, the competitor benchmark, the fixture harness, experiment
+# runners — and it is kept here for reference rather than pushed to
+# every clone.
+#
+# It is not lost: it is in the git history (commit f4c4795 has all of
+# it), and it is on disk. `git checkout f4c4795 -- <path>` brings any
+# of it back into the working tree.
+/PLAN.md
+/OSS.md
+/ENterprise.md
+/CHANGELOG.md
+/requirements.txt
+/requirements-ocr.txt
+/requirements-rerank.txt
+/requirements-optin.txt
+/docs/audits/
+/benchmark/
+/tests/benchmarks/
+/scripts/run_chunking_experiments.py
+/scripts/analyze_chunking_grid.py
+/scripts/tag_queries.py
+
+# The eval_v2 parse cache: parsed blocks and chunks, rebuilt by the run.
+eval_v2/parse_cache/

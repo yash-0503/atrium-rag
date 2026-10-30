@@ -1,0 +1,9 @@
+{
+  "name": "Cat photograph (Wikimedia Commons)",
+  "format": "image/jpeg",
+  "_source": "https://upload.wikimedia.org/wikipedia/commons/thumb/3/3a/Cat03.jpg/120px-Cat03.jpg",
+  "_license": "CC BY-SA 2.0 (Wikipedia Commons)",
+  "expected_element_types": ["image_caption"],
+  "min_chunks": 1,
+  "_note": "Real 120x120 JPEG of a cat. Tests the raw_image path: with no vision adapter or OCR configured, the parser emits a single placeholder element of type 'image_caption' containing '[Image — no vision or OCR adapter configured]'. With a vision adapter, it would queue a vision call."
+}

@@ -1,0 +1,9 @@
+{
+  "name": "RTF fixture — DEFERRED, not yet sourced",
+  "format": "rtf",
+  "_source": null,
+  "_license": null,
+  "expected_element_types": [],
+  "min_chunks": 0,
+  "_note": "DEFERRED per `docs/audits/PARSING_AUDIT.md` §5.2. Public-domain RTF files are rare (Project Gutenberg does not distribute in RTF). pandoc was not available on the build host to convert TXT -> RTF. The `app/universal_parser.py:_parse_rtf` code path remains untested as of this commit. Tracked as a follow-up."
+}

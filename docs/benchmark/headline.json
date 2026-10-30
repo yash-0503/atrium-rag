@@ -1,0 +1,59 @@
+{
+  "generated": "2026-10-30T20:07:09.483086+00:00",
+  "runs": [
+    "2026-10-30T19:04:06.590192+00:00",
+    "2026-10-30T19:17:45.889338+00:00",
+    "2026-10-30T19:11:34.182193+00:00"
+  ],
+  "documents": 23,
+  "questions": 700,
+  "unreviewed_gated_questions": 360,
+  "configuration": {
+    "pdf_backend": "pdfplumber (MIT)",
+    "chunker": "atrium smart_chunker / precise (structure-aware)",
+    "embedder": "bge-large (1024-d)",
+    "retrieval": "hybrid \u2014 Reciprocal Rank Fusion over dense + BM25",
+    "reranker": "off"
+  },
+  "systems": [
+    {
+      "name": "atrium",
+      "recall_at_5": 0.7,
+      "recall_at_5_ci": [
+        0.594,
+        0.799
+      ],
+      "recall_at_10": 0.769,
+      "mrr": 0.574,
+      "parse_seconds": 87.7,
+      "peak_rss_mb": 1016,
+      "chunks": 1723
+    },
+    {
+      "name": "docling",
+      "recall_at_5": 0.686,
+      "recall_at_5_ci": [
+        0.565,
+        0.798
+      ],
+      "recall_at_10": 0.726,
+      "mrr": 0.54,
+      "parse_seconds": 554.0,
+      "peak_rss_mb": 3482,
+      "chunks": 1811
+    },
+    {
+      "name": "unstructured",
+      "recall_at_5": 0.614,
+      "recall_at_5_ci": [
+        0.497,
+        0.725
+      ],
+      "recall_at_10": 0.688,
+      "mrr": 0.486,
+      "parse_seconds": 195.3,
+      "peak_rss_mb": 855,
+      "chunks": 2617
+    }
+  ]
+}

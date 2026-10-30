@@ -1,0 +1,9 @@
+{
+  "name": "Frankenstein; or, the Modern Prometheus — Mary Shelley (Project Gutenberg)",
+  "format": "txt",
+  "_source": "https://www.gutenberg.org/files/84/84-0.txt",
+  "_license": "Public Domain (US — published 1818)",
+  "expected_element_types": ["paragraph"],
+  "min_chunks": 10,
+  "_note": "Real Project Gutenberg full text. Has the standard Gutenberg header/footer ('START OF THE PROJECT GUTENBERG EBOOK', license boilerplate) that the parser does NOT need to special-case — it just splits on blank lines. 153 KB, multi-chapter novel, italicized text (rendered as _text_), quotes, apostrophes."
+}

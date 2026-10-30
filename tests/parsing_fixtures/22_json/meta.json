@@ -1,0 +1,9 @@
+{
+  "name": "Wikipedia REST API summary — Transformer (deep learning)",
+  "format": "json",
+  "_source": "https://en.wikipedia.org/api/rest_v1/page/summary/Transformer_(deep_learning)",
+  "_license": "CC BY-SA 4.0 (Wikipedia content)",
+  "expected_element_types": ["paragraph"],
+  "min_chunks": 1,
+  "_note": "Real Wikipedia REST API response. Nested objects, arrays, HTML in string fields, special characters (parens, ampersands), Unicode. Tests the JSON parser's flattening into paragraph-shaped elements without losing key info."
+}

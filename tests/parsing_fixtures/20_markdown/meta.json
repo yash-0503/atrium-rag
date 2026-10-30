@@ -1,0 +1,9 @@
+{
+  "name": "Rust Programming Language README (rust-lang/rust)",
+  "format": "md",
+  "_source": "https://raw.githubusercontent.com/rust-lang/rust/master/README.md",
+  "_license": "MIT (rust-lang/rust repository)",
+  "expected_element_types": ["heading", "paragraph", "list_item"],
+  "min_chunks": 3,
+  "_note": "Real GitHub README with HTML, badge images, mixed-case headings, bullet lists, hyperlinks. Tests the Markdown parser's handling of HTML embedded in MD (which is allowed by the spec and common in real READMEs)."
+}
