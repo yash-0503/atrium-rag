@@ -561,9 +561,9 @@ class TestPgVectorUpsertPersistsV1Metadata:
 
 class TestEmbedderConfigConsistency:
     def setup_method(self):
-        # Make sure no EMBED_MODEL / EMBED_DIM / OLLAMA_BASE_URL leak
+        # Make sure no EMBED_MODEL / EMBED_DIM / EMBED_BASE_URL leak
         # from the test env.
-        for var in ("EMBED_MODEL", "EMBED_DIM", "OLLAMA_BASE_URL"):
+        for var in ("EMBED_MODEL", "EMBED_DIM", "EMBED_BASE_URL"):
             os.environ.pop(var, None)
 
     def test_default_model_and_dim_match_documented_baseline(self):
@@ -590,10 +590,10 @@ class TestEmbedderConfigConsistency:
         # worker.py does. With no env override, the resulting
         # (model, dim) must be identical.
         e_main = build_embedder(base_url=os.getenv(
-            "OLLAMA_BASE_URL", "http://host.docker.internal:11434",
+            "EMBED_BASE_URL", "http://host.docker.internal:11434",
         ))
         e_worker = build_embedder(base_url=os.getenv(
-            "OLLAMA_BASE_URL", "http://host.docker.internal:11434",
+            "EMBED_BASE_URL", "http://host.docker.internal:11434",
         ))
         assert e_main.model == e_worker.model
         assert e_main.dimension == e_worker.dimension

@@ -35,7 +35,6 @@ import time
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Sequence, Tuple
 
-import click
 import typer
 
 from atrium import __version__
@@ -106,7 +105,7 @@ def _quiet_logs(verbose: bool = False) -> None:
 # There is deliberately no "default" key here. Defaults live in
 # `atrium.config.DEFAULTS`, which is the single source of truth shared
 # with the runtime and `doctor`. A second copy of a default is how
-# `OLLAMA_BASE_URL` ended up with four different values.
+# `EMBED_BASE_URL` ended up with four different values.
 #
 # Type drives parsing + validation. secret=True masks the value in
 # `configure --show`.
@@ -116,9 +115,9 @@ CONFIG_SCHEMA: List[Dict[str, Any]] = [
     {
         "key": "VECTOR_DB",
         "type": "choice",
-        "choices": ["qdrant", "pgvector"],
+        "choices": ["sqlite", "qdrant", "pgvector"],
         "prompt": "Vector database backend",
-        "help": "qdrant (default) or pgvector",
+        "help": "sqlite (a local file, nothing to run) or qdrant or pgvector",
         "secret": False,
     },
     {
@@ -138,6 +137,14 @@ CONFIG_SCHEMA: List[Dict[str, Any]] = [
         "depends_on": ("VECTOR_DB", "qdrant"),
     },
     {
+        "key": "LOCAL_DB_PATH",
+        "type": "str",
+        "prompt": "Where the local store keeps its file",
+        "help": "the SQLite file used when VECTOR_DB=sqlite",
+        "secret": False,
+        "depends_on": ("VECTOR_DB", "sqlite"),
+    },
+    {
         "key": "PG_CONN",
         "type": "str",
         "prompt": "Postgres connection string",
@@ -146,10 +153,25 @@ CONFIG_SCHEMA: List[Dict[str, Any]] = [
         "depends_on": ("VECTOR_DB", "pgvector"),
     },
     {
-        "key": "OLLAMA_BASE_URL",
+        "key": "EMBED_BASE_URL",
         "type": "str",
         "prompt": "Embedding provider URL (OpenAI-compatible)",
-        "help": "Base URL for the /v1/embeddings endpoint",
+        "help": "Base URL for the /v1/embeddings endpoint, including /v1",
+        "secret": False,
+    },
+    {
+        "key": "EMBED_API_KEY",
+        "type": "str",
+        "prompt": "Embedding provider API key",
+        "help": "blank for local servers; required by hosted providers",
+        "secret": True,
+    },
+    {
+        "key": "EMBED_PROVIDER",
+        "type": "choice",
+        "choices": ["http", "fastembed"],
+        "prompt": "Embedding provider",
+        "help": "http (any OpenAI-compatible endpoint) or fastembed (in-process)",
         "secret": False,
     },
     {
@@ -491,16 +513,35 @@ def _validate(values: Dict[str, str]) -> List[str]:
 
 
 def _probe_embedder(values: Dict[str, str]) -> Tuple[bool, str]:
-    """Hit /v1/models on the embedder host. Short timeout — this is a
-    reachability check, not a query. Returns (ok, detail)."""
-    base = values.get("OLLAMA_BASE_URL", "")
+    """Is the configured embedding provider there?
+
+    Two providers: an OpenAI-compatible HTTP endpoint, or the
+    in-process embedder from the `local` extra. Returns (ok, detail).
+    """
+    provider = (values.get("EMBED_PROVIDER", "http") or "http").strip().lower()
+    if provider in ("fastembed", "local", "inprocess", "in-process"):
+        try:
+            from atrium.local_embedder import FastEmbedEmbedder
+
+            ok, detail = FastEmbedEmbedder(
+                model=values.get("EMBED_MODEL", "BAAI/bge-small-en-v1.5")
+            ).probe()
+            return ok, detail
+        except Exception as exc:
+            return False, f"{type(exc).__name__}: {exc}"
+
+    base = values.get("EMBED_BASE_URL", "")
     if not base:
-        return False, "OLLAMA_BASE_URL is empty"
+        return False, "EMBED_BASE_URL is empty"
     url = base.rstrip("/").replace("/v1", "") + "/v1/models"
+    headers = {}
+    key = values.get("EMBED_API_KEY", "")
+    if key:
+        headers["Authorization"] = f"Bearer {key}"
     try:
         import httpx
 
-        r = httpx.get(url, timeout=3.0)
+        r = httpx.get(url, timeout=3.0, headers=headers)
         if r.status_code == 200:
             return True, url
         return False, f"{url} -> HTTP {r.status_code}"
@@ -511,8 +552,14 @@ def _probe_embedder(values: Dict[str, str]) -> Tuple[bool, str]:
 def _probe_vector_db(values: Dict[str, str]) -> Tuple[bool, str]:
     """Cheap probe for the configured vector DB backend. Returns
     (ok, detail)."""
-    backend = values.get("VECTOR_DB", "qdrant")
+    backend = values.get("VECTOR_DB", "sqlite")
     try:
+        if backend in ("sqlite", "local", "file"):
+            from atrium.local_store import SqliteAdapter
+
+            path = values.get("LOCAL_DB_PATH", "atrium_local.db")
+            SqliteAdapter(path=path).health()
+            return True, f"local file {path}"
         if backend == "qdrant":
             from qdrant_client import QdrantClient
 
@@ -543,15 +590,34 @@ def _probe_embedder_model(values: Dict[str, str]) -> Tuple[bool, str]:
     in Ollama's registry, and the error only shows up on the first
     ingest, minutes later.
     """
-    base = values.get("OLLAMA_BASE_URL", "")
+    provider = (values.get("EMBED_PROVIDER", "http") or "http").strip().lower()
     model = values.get("EMBED_MODEL", "")
+    if provider in ("fastembed", "local", "inprocess", "in-process"):
+        from atrium.local_embedder import SUGGESTED_MODELS
+
+        if not model:
+            return False, "EMBED_MODEL is empty"
+        if model in SUGGESTED_MODELS:
+            return True, f"{model} ({SUGGESTED_MODELS[model]}-d)"
+        try:
+            from atrium.local_embedder import FastEmbedEmbedder
+
+            ok, detail = FastEmbedEmbedder(model=model).probe()
+            return ok, detail
+        except Exception as exc:
+            return False, f"{type(exc).__name__}: {exc}"
+    base = values.get("EMBED_BASE_URL", "")
     if not base or not model:
-        return False, "OLLAMA_BASE_URL or EMBED_MODEL is empty"
+        return False, "EMBED_BASE_URL or EMBED_MODEL is empty"
     url = base.rstrip("/").replace("/v1", "") + "/v1/models"
+    headers = {}
+    key = values.get("EMBED_API_KEY", "")
+    if key:
+        headers["Authorization"] = f"Bearer {key}"
     try:
         import httpx
 
-        r = httpx.get(url, timeout=3.0)
+        r = httpx.get(url, timeout=3.0, headers=headers)
         if r.status_code != 200:
             return False, f"{url} -> HTTP {r.status_code}"
         # The OpenAI-compatible shape uses `id`; Ollama's native
@@ -590,110 +656,65 @@ def init(
     non_interactive: bool = typer.Option(
         False,
         "--non-interactive",
-        help="Skip prompts and write a default .env. Useful for CI / smoke tests.",
+        help="Skip prompts: detect what is available and write the best "
+             "configuration. Useful for CI.",
+    ),
+    assume_yes: bool = typer.Option(
+        False,
+        "--yes",
+        help="Answer yes to every setup action (pull a model, start a "
+             "container, install an extra).",
     ),
     force: bool = typer.Option(
         False,
         "--force",
         help="Overwrite an existing .env without asking.",
     ),
+    as_json: bool = typer.Option(
+        False,
+        "--json",
+        help="Print the result as JSON.",
+    ),
 ) -> None:
-    """First-run wizard. Writes .env with your chosen settings.
+    """Set Atrium up on this machine.
 
-    Re-running never destroys what you already set: existing values are
-    shown as the prompt default, and pressing Enter keeps them.
+    Detects what is installed and running, proposes a vector store and
+    an embedding provider, offers to fix what it can — each action
+    behind its own yes/no — and shows you the result before anything is
+    written.
+
+    Existing settings are kept: re-running never silently drops what
+    you configured.
     """
+    from atrium.setup import run_wizard
+
     target = env_path(env)
     existing = read_env_file(target) if target.exists() else {}
 
+    if target.exists() and non_interactive and not force:
+        _err_console().print(
+            f"[bad]refusing to overwrite {target}[/] (use --force)",
+        )
+        raise typer.Exit(code=2)
     if target.exists() and not force:
-        if non_interactive:
-            _err_console().print(
-                f"[bad]refusing to overwrite {target}[/] (use --force)",
-            )
-            raise typer.Exit(code=2)
-        if not typer.confirm(f"{target} already exists — edit it?", default=True):
+        if not typer.confirm(
+            f"{target} already exists — review and update it?", default=True
+        ):
             raise typer.Abort()
 
-    # Seed from the existing file so the prompts show the operator's
-    # real values, not the schema defaults. This is the difference
-    # between "re-running init is safe" and "re-running init silently
-    # resets everything you configured".
-    #
-    # Every key the runtime reads is seeded, not just the ones the
-    # wizard asks about — so the written `.env` is a complete map of
-    # the configuration surface, with the operator's existing values
-    # preserved.
-    values: Dict[str, str] = {
-        key: existing.get(key, _default_for(key)) for key in _ALL_KEYS
-    }
-
-    if not non_interactive:
-        console.print(
-            Panel(
-                f"atrium v{__version__}\n"
-                "Press Ctrl-C at any prompt to abort.\n"
-                f"[dim]Writing to {target}[/]",
-                title="[accent]atrium init[/]",
-                border_style="cyan",
-            ),
-        )
-        for entry in CONFIG_SCHEMA:
-            k = entry["key"]
-            # Skip keys gated by depends_on so we don't ask about the
-            # pgvector DSN when the user picked Qdrant.
-            dep = entry.get("depends_on")
-            if dep is not None:
-                gate_key, gate_val = dep
-                if values.get(gate_key) != gate_val:
-                    continue
-            current = values[k]
-            was_set = k in existing
-            suffix = " [dim](current)[/]" if was_set else ""
-            prompt = f"[key]{k}[/] — {entry['prompt']} [{current}]{suffix}"
-            if entry["type"] == "choice":
-                raw = typer.prompt(
-                    prompt,
-                    default=current,
-                    type=click.Choice(entry["choices"]),
-                    show_choices=True,
-                )
-            elif entry["type"] == "bool":
-                raw = typer.prompt(
-                    prompt,
-                    default=current == "1",
-                    type=click.BOOL,
-                )
-                raw = "1" if raw else "0"
-            elif entry["type"] == "int":
-                raw = str(
-                    typer.prompt(prompt, default=current, type=int),
-                )
-            else:
-                raw = typer.prompt(
-                    prompt,
-                    default=current,
-                    hide_input=entry.get("secret", False),
-                )
-            values[k] = raw
-
-    # Validate before writing — saves a round-trip if the operator
-    # typed something that can't be coerced.
-    problems = _validate(values)
-    if problems:
-        _err_console().print("[bad]Configuration is invalid:[/]")
-        for p in problems:
-            _err_console().print(f"  [bad]-[/] {p}")
-        raise typer.Exit(code=1)
-
-    _write_env(target, values)
-
-    console.print()
-    console.print(f"[ok]Wrote[/] {target}")
-    console.print(
-        "[dim]Next:[/] [key]atrium doctor[/] to check the stack, "
-        "then [key]atrium ingest ./docs/[/]",
+    code = run_wizard(
+        target,
+        defaults=DEFAULTS,
+        existing=existing,
+        non_interactive=non_interactive,
+        assume_yes=assume_yes,
+        force=force,
+        as_json=as_json,
+        console=console,
+        err_console=_err_console(),
     )
+    if code:
+        raise typer.Exit(code=code)
 
 
 @app.command()
@@ -788,7 +809,7 @@ def doctor(
     table.add_row("python", sys.version.split()[0])
     table.add_row(".env", str(target))
     table.add_row("vector db", effective.get("VECTOR_DB", "?"))
-    table.add_row("embedder", effective.get("OLLAMA_BASE_URL", "?"))
+    table.add_row("embedder", effective.get("EMBED_BASE_URL", "?"))
     table.add_row("model", effective.get("EMBED_MODEL", "?"))
     api_key_state = "set" if effective.get("API_KEY") else "[warn]not set[/]"
     table.add_row("api key", api_key_state)
@@ -881,20 +902,50 @@ def _collect_files(paths: Sequence[str]) -> List[Path]:
     return unique
 
 
+def _setup_failed(exc) -> None:
+    """Report a setup problem the way the user should see it.
+
+    A missing service or an unset variable is not a crash: it is a
+    sentence and a way out.
+    """
+    _err_console().print(f"[bad]{exc.message}[/]")
+    for hint in getattr(exc, "hints", ()):  # pragma: no branch
+        _err_console().print(f"  [dim]{hint}[/]")
+    raise typer.Exit(code=1)
+
+
 def _build_runtime():
     """Construct the parser, embedder and vector DB from the resolved
-    configuration. Imported lazily so `atrium --help` stays fast."""
+    configuration. Imported lazily so `atrium --help` stays fast.
+
+    A setup problem — no embedding endpoint, a store that is not there
+    — is reported as a sentence and a way out, never as a traceback.
+    """
+    from atrium.errors import AtriumSetupError
+
+    try:
+        return _build_runtime_inner()
+    except AtriumSetupError as exc:
+        _setup_failed(exc)
+
+
+def _build_runtime_inner():
+    """The construction itself; `_build_runtime` handles the failures."""
     from atrium.adapters import PgVectorAdapter, QdrantAdapter
     from atrium.config import env_bool, env_float, env_str
     from atrium.embedder_config import build_embedder
+    from atrium.errors import AtriumSetupError
     from atrium.universal_parser import UniversalParser
     from atrium.vision_adapters import OllamaVisionAdapter
 
-    embedder = build_embedder()
+    try:
+        embedder = build_embedder()
+    except AtriumSetupError as exc:
+        _setup_failed(exc)
 
     vision = None
     if env_bool("VISION_ENABLED"):
-        base = env_str("OLLAMA_BASE_URL").replace("/v1", "").rstrip("/")
+        base = env_str("EMBED_BASE_URL").replace("/v1", "").rstrip("/")
         vision = OllamaVisionAdapter(
             base_url=base,
             model=env_str("VISION_MODEL"),
@@ -915,13 +966,42 @@ def _build_runtime():
 
     parser = UniversalParser(vision_adapter=vision, ocr_adapter=ocr)
 
-    if env_str("VECTOR_DB") == "pgvector":
+    backend = env_str("VECTOR_DB") or "sqlite"
+    if backend == "pgvector":
         db = PgVectorAdapter(conn_info=env_str("PG_CONN"))
+    elif backend in ("sqlite", "local", "file"):
+        from atrium.local_store import SqliteAdapter
+
+        db = SqliteAdapter(path=env_str("LOCAL_DB_PATH") or "atrium_local.db")
     else:
         db = QdrantAdapter(
             host=env_str("QDRANT_HOST"),
             port=int(env_str("QDRANT_PORT")),
         )
+
+    # A store that is not there is a setup problem, and this is the
+    # moment to say so — before a document has been parsed and embedded.
+    if not db.health():
+        from atrium.errors import AtriumSetupError
+
+        if backend == "qdrant":
+            raise AtriumSetupError(
+                f"Qdrant is not reachable at {env_str('QDRANT_HOST')}:"
+                f"{env_str('QDRANT_PORT')}.",
+                hints=(
+                    "Start it: `docker compose --profile qdrant up -d qdrant`",
+                    "Or use the local store, which needs no server: "
+                    "set VECTOR_DB=sqlite in .env",
+                ),
+            )
+        if backend == "pgvector":
+            raise AtriumSetupError(
+                "The Postgres server is not reachable.",
+                hints=(
+                    "Start Postgres, or point PG_CONN at it",
+                    "Or use the local store: set VECTOR_DB=sqlite in .env",
+                ),
+            )
     return parser, embedder, db
 
 

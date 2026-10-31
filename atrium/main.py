@@ -1,6 +1,8 @@
 import asyncio
 import base64
 import logging
+import os
+import sys
 import time
 import uuid
 from collections import OrderedDict
@@ -16,6 +18,7 @@ from pydantic import BaseModel, Field
 from atrium.adapters import PgVectorAdapter, QdrantAdapter
 from atrium.config import env_bool, env_float, env_int, env_str
 from atrium.embedder_config import build_embedder, default_base_url
+from atrium.errors import AtriumSetupError
 from atrium.job_store import JobStore
 from atrium.pipeline import run_ingestion
 from atrium.security import (
@@ -101,6 +104,62 @@ DB_TYPE = env_str("VECTOR_DB")
 _db: Optional[Any] = None
 
 
+
+
+def _explain(exc: Exception) -> str:
+    """An exception's message, with its ways out when it has them."""
+    render = getattr(exc, "render", None)
+    if callable(render):
+        return render()
+    return str(exc)
+
+
+def _abort_startup(message: str) -> None:
+    """Print the reason and leave, without a stack trace.
+
+    `os._exit` is deliberate. Uvicorn reports a failed startup as an
+    exception, and a traceback for "the database is not running" buries
+    the one sentence the operator needs. Nothing has started yet, so
+    there is nothing to clean up.
+    """
+    print(message, file=sys.stderr)
+    sys.stderr.flush()
+    sys.stdout.flush()
+    os._exit(1)
+
+
+def _store_unreachable_message(exc: Exception) -> str:
+    """What to say when the vector store is not there.
+
+    Two ways out, always: start the store, or use the local one that
+    needs nothing running.
+    """
+    store = DB_TYPE or "sqlite"
+    if store == "qdrant":
+        detail = (
+            f"Qdrant is not reachable at {env_str('QDRANT_HOST')}:"
+            f"{env_int('QDRANT_PORT')}."
+        )
+        hints = (
+            "Start it: `docker compose --profile qdrant up -d qdrant`",
+            "Or use the local store, which needs no server: "
+            "set VECTOR_DB=sqlite in .env",
+        )
+    elif store == "pgvector":
+        detail = "The Postgres server is not reachable."
+        hints = (
+            "Start Postgres, or point PG_CONN at it",
+            "Or use the local store: set VECTOR_DB=sqlite in .env",
+        )
+    else:
+        detail = f"The local store could not be opened: {exc}"
+        hints = (
+            "Check that LOCAL_DB_PATH is writable",
+            "Or pick another store: `atrium init`",
+        )
+    return "\n".join([detail, "", *(f"  {hint}" for hint in hints)])
+
+
 def _build_db():
     """Construct the vector-DB adapter (cached in `_db`)."""
     global _db
@@ -109,8 +168,20 @@ def _build_db():
             _db = QdrantAdapter(
                 host=env_str("QDRANT_HOST"), port=env_int("QDRANT_PORT"),
             )
-        else:
+        elif DB_TYPE == "pgvector":
             _db = PgVectorAdapter(conn_info=env_str("PG_CONN"))
+        elif DB_TYPE in ("sqlite", "local", "file"):
+            # The local store: a SQLite file, no server. The default,
+            # because a fresh install that works beats a fresh install
+            # that needs Docker first.
+            from atrium.local_store import SqliteAdapter
+
+            _db = SqliteAdapter(path=env_str("LOCAL_DB_PATH"))
+        else:
+            raise ValueError(
+                f"unknown VECTOR_DB {DB_TYPE!r}; expected one of: "
+                f"sqlite, qdrant, pgvector"
+            )
     return _db
 
 
@@ -151,7 +222,7 @@ def __getattr__(name: str):
 # on slow hardware (9 timeouts in the 2026-10-17 Test B run).
 # (2026-10-17: vision was already unconditionally wired; this change
 # adds the toggle + env-driven timeout, doesn't alter default behavior.)
-raw_url = env_str("OLLAMA_BASE_URL")
+raw_url = env_str("EMBED_BASE_URL")
 # Strip /v1 if it exists so we have a clean base host
 clean_host = raw_url.replace("/v1", "").rstrip("/")
 vision = None
@@ -207,7 +278,15 @@ parser = UniversalParser(vision_adapter=vision, ocr_adapter=ocr_adapter)
 # atrium/embedder_config.py for the default model + dimension. Both the
 # HTTP service and the worker construct the embedder through
 # `build_embedder()` so they cannot drift on model or dim.
-embedder = build_embedder(base_url=default_base_url())
+try:
+    embedder = build_embedder(base_url=default_base_url())
+except AtriumSetupError as exc:
+    # No embedding endpoint is configured. That is a setup problem, not
+    # a crash: the process must still be able to start far enough to
+    # say so, so the message is kept and the lifespan reports it.
+    embedder = None
+    EMBEDDER_SETUP_ERROR = exc
+    log.error("%s", exc.render())
 
 
 @asynccontextmanager
@@ -224,6 +303,24 @@ async def lifespan(app: FastAPI):
     module import, so tests that import `atrium.main` (e.g.
     `tests/test_v0_suite.py`) don't trigger the network call.
     """
+    if embedder is None:
+        # The embedding endpoint is not configured. Say exactly what to
+        # do and stop, instead of failing later with a traceback.
+        _abort_startup(EMBEDDER_SETUP_ERROR.render())
+
+    # The embedding endpoint is probed, not required. A service that
+    # refuses to start because the embedder is briefly down is worse
+    # than one that starts, says so, and answers with the reason.
+    probe = getattr(embedder, "probe", None)
+    if probe is not None:
+        reachable, detail = probe()
+        if not reachable:
+            log.warning(
+                "the embedding endpoint is not answering (%s). The service "
+                "is up, but /ingest and /search will fail until it is: "
+                "run `atrium init` to point at a reachable one.",
+                detail,
+            )
     try:
         _get_db().ensure_collection("documents", embedder.dimension)
         log.info(
@@ -255,11 +352,20 @@ async def lifespan(app: FastAPI):
             "QDRANT_HOST / QDRANT_PORT / PG_CONN point at it.",
             type(exc).__name__, exc,
         )
-        raise
+        _abort_startup(_store_unreachable_message(exc))
     yield
 
 
 app = FastAPI(title="Atrium", lifespan=lifespan)
+
+
+@app.exception_handler(AtriumSetupError)
+async def _setup_error_handler(request: Request, exc: AtriumSetupError):
+    """A setup problem reaches the client as a sentence.
+
+    The status is 503: the service is fine, the dependency is not.
+    """
+    return JSONResponse(status_code=503, content={"detail": exc.render()})
 
 
 # Bearer-token gate. Skipped when API_KEY is empty (dev default).
@@ -433,7 +539,7 @@ async def search(body: SearchRequest):
         query_vector = (await asyncio.to_thread(embedder.embed, [query]))[0]
     except Exception as exc:
         log.warning("search embed failed: %s", exc)
-        raise HTTPException(503, f"Embedder unavailable: {exc}") from exc
+        raise HTTPException(503, f"Embedder unavailable: {_explain(exc)}") from exc
 
     try:
         hits = await asyncio.to_thread(
@@ -1045,7 +1151,12 @@ async def retrieval_lab_prepare(
             )
         except Exception as exc:
             log.warning("retrieval_lab/prepare embed failed: %s", exc)
-            raise HTTPException(503, f"Embedder unavailable: {exc}") from exc
+            # The ways out travel with the message: a 503 that says
+            # "not answering" and nothing else leaves the operator
+            # guessing.
+            raise HTTPException(
+                503, f"Embedder unavailable: {_explain(exc)}"
+            ) from exc
 
         # L2-normalize so cosine sim reduces to a single matmul. bge-large
         # returns normalized vectors in practice, but we normalize defensively
@@ -1172,7 +1283,7 @@ async def retrieval_lab_search(
         )
     except Exception as exc:
         log.warning("retrieval_lab/search embed failed: %s", exc)
-        raise HTTPException(503, f"Embedder unavailable: {exc}") from exc
+        raise HTTPException(503, f"Embedder unavailable: {_explain(exc)}") from exc
 
     # L2-normalize the query, then dot with all chunk embeddings. Both sides
     # are unit vectors after the prep step + this line, so the product is

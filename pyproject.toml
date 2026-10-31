@@ -80,12 +80,33 @@ dependencies = [
     "starlette>=0.40.0",
     # Format coverage: pure-Python parsers for text/markdown/csv/json,
     # RTF, legacy XLS, and OpenDocument.
+    # Imported directly by the package, so declared here rather than
+    # arriving by accident through another dependency:
+    #   numpy  — the retrieval lab's cosine math
+    #   Pillow — image handling in the parser and the OCR adapter
+    #   rich   — the CLI's tables and panels
+    "numpy>=1.26",
+    "pillow>=10.0.0",
+    "rich>=13.0.0",
     "striprtf>=0.0.26",
     "xlrd>=1.2.0,<2.0",   # 2.0+ dropped .xls support
     "odfpy>=1.4.0",
 ]
 
 [project.optional-dependencies]
+# The in-process embedder: ONNX, no server, no API key, no GPU.
+#
+# The weights are downloaded on first use and cached — a model is tens
+# of megabytes and belongs on the machine, not in a wheel. With this
+# installed, `atrium init` can set up a working product with nothing
+# else running.
+#
+#     pip install "atrium-rag[local]"
+#
+# The default model is BAAI/bge-small-en-v1.5 (384 dimensions).
+local = [
+    "fastembed>=0.4.0",
+]
 # Vision: Ollama vision adapter (minicpm-v / llava). Already required
 # for image documents; bundled as an extra so dev installs without a
 # local Ollama stay slim.

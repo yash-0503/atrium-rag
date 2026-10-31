@@ -39,7 +39,7 @@ def _stack_reachable() -> bool:
     try:
         import httpx
         qdrant_url = os.getenv("QDRANT_URL", "http://localhost:6333")
-        ollama_url = os.getenv("OLLAMA_BASE_URL", "http://localhost:11434")
+        ollama_url = os.getenv("EMBED_BASE_URL", "http://localhost:11434")
         for url in (qdrant_url, ollama_url):
             try:
                 r = httpx.get(url, timeout=1.5)

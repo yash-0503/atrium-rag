@@ -68,7 +68,7 @@ signal.signal(signal.SIGINT, _handle_signal)
 # without coordinating with the API.
 def _build_parser_and_ocr():
     """Returns (parser, ocr_adapter_or_None). Mirrors atrium/main.py."""
-    raw_url = env_str("OLLAMA_BASE_URL")
+    raw_url = env_str("EMBED_BASE_URL")
     clean_host = raw_url.replace("/v1", "").rstrip("/")
 
     # Vision is gated on VISION_ENABLED here too. The worker used to

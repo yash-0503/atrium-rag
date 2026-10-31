@@ -30,7 +30,7 @@ code, not inferred:
    Every other entry point was wide open.
 
 2. **The same variable had different defaults in different modules.**
-   ``OLLAMA_BASE_URL`` had four — ``host.docker.internal:11434`` in
+   ``EMBED_BASE_URL`` had four — ``host.docker.internal:11434`` in
    ``embedder_config.py`` and ``worker.py``, ``http://localhost:11434``
    in ``main.py`` and the CLI. ``QDRANT_HOST`` had two — ``qdrant`` and
    ``localhost``. So ``atrium doctor`` probed ``localhost`` while the
@@ -98,12 +98,26 @@ __all__ = [
 
 DEFAULTS: Dict[str, str] = {
     # -- vector store ------------------------------------------------------
-    "VECTOR_DB": "qdrant",
+    # The local SQLite store is the default: a fresh install works
+    # without Docker or a database server. Qdrant and pgvector stay
+    # supported and are the right choice once the corpus outgrows a
+    # file on disk.
+    "VECTOR_DB": "sqlite",
     "QDRANT_HOST": "localhost",
     "QDRANT_PORT": "6333",
     "PG_CONN": "postgresql://user:pass@pgvector:5432/db",
     # -- embeddings / provider --------------------------------------------
-    "OLLAMA_BASE_URL": "http://localhost:11434",
+    # The base URL is any OpenAI-compatible server: Ollama's /v1, OpenAI,
+    # vLLM, LM Studio, TEI, Together. It is named for the *shape* of the
+    # API, not for one vendor.
+    "EMBED_BASE_URL": "http://localhost:11434/v1",
+    # Blank for local servers; required by hosted providers.
+    "EMBED_API_KEY": "",
+    # "http" for any OpenAI-compatible endpoint, "fastembed" for the
+    # in-process ONNX embedder from the `local` extra.
+    "EMBED_PROVIDER": "http",
+    # -- local store -------------------------------------------------------
+    "LOCAL_DB_PATH": "atrium_local.db",
     # "bge-large" is the tag Ollama resolves. "bge-large-en-v1.5" — the
     # name in the original code — is not in Ollama's registry, so the
     # default pointed at a model that could never be pulled.
@@ -258,7 +272,7 @@ def env_str(name: str, default: Optional[str] = None) -> str:
     :func:`load_env_file`), then :data:`DEFAULTS`, then ``default``.
 
     An *empty* environment value is treated as unset. That keeps
-    ``OLLAMA_BASE_URL=`` in a ``.env`` from producing a broken URL, and
+    ``EMBED_BASE_URL=`` in a ``.env`` from producing a broken URL, and
     it costs nothing for the keys whose default is legitimately empty
     (``API_KEY``, ``ALLOWED_MIME_TYPES``, ``COHERE_API_KEY``) — those
     still resolve to ``""``.
@@ -341,9 +355,12 @@ class Settings:
     qdrant_host: str = "localhost"
     qdrant_port: int = 6333
     pg_conn: str = "postgresql://user:pass@pgvector:5432/db"
+    local_db_path: str = "atrium_local.db"
 
     # embeddings / provider
-    ollama_base_url: str = "http://localhost:11434"
+    embed_base_url: str = "http://localhost:11434/v1"
+    embed_api_key: str = ""
+    embed_provider: str = "http"
     embed_model: str = "bge-large"
     embed_dim: int = 1024
 
@@ -406,7 +423,10 @@ def get_settings() -> Settings:
         qdrant_host=env_str("QDRANT_HOST"),
         qdrant_port=env_int("QDRANT_PORT"),
         pg_conn=env_str("PG_CONN"),
-        ollama_base_url=env_str("OLLAMA_BASE_URL"),
+        local_db_path=env_str("LOCAL_DB_PATH"),
+        embed_base_url=env_str("EMBED_BASE_URL"),
+        embed_api_key=env_str("EMBED_API_KEY"),
+        embed_provider=env_str("EMBED_PROVIDER"),
         embed_model=env_str("EMBED_MODEL"),
         embed_dim=env_int("EMBED_DIM"),
         vision_enabled=env_bool("VISION_ENABLED"),

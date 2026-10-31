@@ -148,28 +148,116 @@ class VectorDBAdapter(Protocol):
     ) -> Dict[str, Dict[str, Any]]: ...
 
 class OpenAICompatibleEmbedder:
-    def __init__(self, base_url: str, model: str = "nomic-embed-text:v1.5", dim: int = 768):
+    """Any server that speaks the OpenAI `/v1/embeddings` API.
+
+    The base URL is the only thing that changes between Ollama, OpenAI,
+    vLLM, LM Studio, TEI and Together. An API key is sent when one is
+    configured; local servers ignore it.
+
+    Failures raise `AtriumSetupError` with the ways out, because a
+    missing server is a setup problem and not a bug.
+    """
+
+    def __init__(
+        self,
+        base_url: str,
+        model: str = "bge-large",
+        dim: int = 1024,
+        api_key: str = "",
+    ):
         self.base_url = base_url.rstrip("/")
         self.model = model
         self._dim = dim
+        self.api_key = api_key or ""
+
+    def _headers(self) -> Dict[str, str]:
+        headers = {"Content-Type": "application/json"}
+        if self.api_key:
+            headers["Authorization"] = f"Bearer {self.api_key}"
+        return headers
 
     def embed(self, texts: List[str]) -> List[List[float]]:
         import httpx  # deferred; ~48 ms, and only the embedder needs it.
 
-        with httpx.Client(timeout=60.0) as client:
-            resp = client.post(f"{self.base_url}/embeddings", json={"input": texts, "model": self.model})
-            resp.raise_for_status()
-            return [item["embedding"] for item in resp.json()["data"]]
-            
+        from atrium.errors import AtriumSetupError
+
+        try:
+            with httpx.Client(timeout=120.0) as client:
+                resp = client.post(
+                    f"{self.base_url}/embeddings",
+                    headers=self._headers(),
+                    json={"input": texts, "model": self.model},
+                )
+                resp.raise_for_status()
+                return [item["embedding"] for item in resp.json()["data"]]
+        except httpx.ConnectError as exc:
+            raise AtriumSetupError(
+                f"The embedding endpoint at {self.base_url} is not answering.",
+                hints=(
+                    "Start it, or pick another endpoint: `atrium init`",
+                    "For a local server: `ollama serve`, then "
+                    "`ollama pull " + self.model + "`",
+                ),
+            ) from exc
+        except httpx.HTTPStatusError as exc:
+            status = exc.response.status_code
+            if status in (401, 403):
+                raise AtriumSetupError(
+                    f"The embedding endpoint at {self.base_url} rejected the "
+                    f"API key (HTTP {status}).",
+                    hints=(
+                        "Set EMBED_API_KEY in .env, or point at a server that "
+                        "needs no key",
+                    ),
+                ) from exc
+            if status == 404:
+                raise AtriumSetupError(
+                    f"The embedding endpoint at {self.base_url} has no "
+                    f"`/embeddings` route (HTTP 404).",
+                    hints=(
+                        "Check the URL ends at the API root, e.g. "
+                        "http://localhost:11434/v1",
+                    ),
+                ) from exc
+            raise AtriumSetupError(
+                f"The embedding endpoint at {self.base_url} returned HTTP "
+                f"{status} for model \"{self.model}\".",
+                hints=(
+                    "Check the model name against the ones the endpoint "
+                    "offers: `curl " + self.base_url + "/models`",
+                ),
+            ) from exc
+
     @property
     def dimension(self) -> int: return self._dim
 
     def health(self) -> bool:
+        return self.probe()[0]
+
+    def probe(self) -> tuple:
+        """(reachable, detail) — what the endpoint says about itself.
+
+        The detail is what `atrium doctor` and the setup wizard print,
+        so it names the reason rather than answering yes or no.
+        """
         import httpx  # deferred; see above.
 
         try:
-            with httpx.Client(timeout=2.0) as c: return c.get(f"{self.base_url}/models").status_code == 200
-        except Exception: return False
+            with httpx.Client(timeout=3.0) as client:
+                resp = client.get(f"{self.base_url}/models", headers=self._headers())
+            if resp.status_code >= 400:
+                return False, f"HTTP {resp.status_code}"
+            payload = resp.json()
+            models = [
+                item.get("id", "")
+                for item in (payload.get("data") or [])
+                if item.get("id")
+            ]
+            if models:
+                return True, ", ".join(models[:8])
+            return True, "no models listed"
+        except Exception as exc:
+            return False, f"{type(exc).__name__}: {exc}"
 
 # Vector DBs -- both implementations of VectorDBAdapter. Tenacity retries
 # on transient failures, dim mismatch checked at collection ensure.

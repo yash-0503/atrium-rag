@@ -36,6 +36,19 @@ are always computed, and the fused ranking is what gets returned.
 
 ## Quickstart
 
+### Set it up
+
+```bash
+pip install atrium-rag
+atrium init             # checks your machine, writes .env, verifies it works
+```
+
+`atrium init` looks at what is installed, asks which vector store and
+which embedding provider you want, offers to pull a model or start a
+container, shows you the configuration before it is written, and then
+checks it by making a real embedding call. Everything it offers to do,
+it asks first.
+
 ### Ingest and search over HTTP
 
 ```bash
@@ -98,12 +111,15 @@ variable beats `.env`, and `.env` beats the built-in default.
 
 | Variable | Default | What it does |
 |---|---|---|
-| `VECTOR_DB` | `qdrant` | `qdrant` or `pgvector` |
+| `VECTOR_DB` | `sqlite` | `sqlite`, `qdrant` or `pgvector` |
+| `LOCAL_DB_PATH` | `atrium_local.db` | Where the local store keeps its file |
 | `QDRANT_HOST` / `QDRANT_PORT` | `localhost` / `6333` | Qdrant address |
 | `PG_CONN` | — | Postgres DSN, when `VECTOR_DB=pgvector` |
-| `OLLAMA_BASE_URL` | `http://localhost:11434` | Any OpenAI-shaped `/v1` endpoint |
-| `EMBED_MODEL` | `bge-large` | Model tag (Ollama) or id (OpenAI) |
-| `EMBED_DIM` | `1024` | Must match the collection's dimension |
+| `EMBED_BASE_URL` | `http://localhost:11434/v1` | Any OpenAI-compatible `/v1` endpoint |
+| `EMBED_API_KEY` | — | Key for that endpoint; blank for local servers |
+| `EMBED_PROVIDER` | `http` | `http`, or `fastembed` for the in-process embedder |
+| `EMBED_MODEL` | `bge-large` | Model name, as that endpoint knows it |
+| `EMBED_DIM` | `1024` | Must match the model's dimension |
 | `DEFAULT_TOP_K` | `8` | Results returned by `/search` |
 | `OCR_ENABLED` | `0` | OCR for scanned pages |
 | `OCR_PROVIDER` | `tesseract` | `tesseract` or `rapidocr` |
@@ -126,6 +142,26 @@ variable beats `.env`, and `.env` beats the built-in default.
 Reranking is off by default: it improves ranking on most corpora but
 regresses on forms, slides, math and OCR'd scans, because the
 cross-encoder was trained on web QA.
+
+---
+
+## Vector stores
+
+| `VECTOR_DB` | What it needs | When to use it |
+|---|---|---|
+| `sqlite` | nothing — a file next to your project | the default; a personal or team corpus |
+| `qdrant` | a running Qdrant | the corpus outgrows a file on disk |
+| `pgvector` | Postgres with the `pgvector` extension | you already run Postgres, and want one database |
+
+The local store is a SQLite file plus a cosine search over it — the
+standard library and nothing else, no server, no Docker, no container.
+It is the default so that a fresh install works before you install
+anything else.
+
+The embedding provider is configured the same way whatever the store:
+any server that speaks the OpenAI `/v1/embeddings` API (Ollama, OpenAI,
+vLLM, LM Studio, TEI, Together), or the in-process ONNX embedder from
+the `local` extra, which needs no server and no key.
 
 ---
 
@@ -209,7 +245,7 @@ every chunk, so a corpus with mixed strategies stays auditable.
 
 | Command | What it does |
 |---|---|
-| `atrium init` | First-run wizard; writes `.env` |
+| `atrium init` | Set the machine up: detect, configure, offer to fix what it can, verify |
 | `atrium configure` | Set one key: `atrium configure --key EMBED_DIM --value 768` |
 | `atrium validate` | Check `.env` against the installed runtime |
 | `atrium doctor` | Probe the stack: embedder, vector DB, security posture |
@@ -286,9 +322,14 @@ parser.
 | `rerank` | `sentence-transformers` |
 | `flashrank` | `flashrank` — ~30MB ONNX reranker |
 | `alt-parsers` | `docling-slim` |
+| `local` | `fastembed` — the in-process ONNX embedder, no server, no key |
 | `fast-pdf` | `pymupdf` — the faster PDF backend (AGPL-3.0) |
 | `vision` | no packages; the adapter talks to Ollama over httpx |
 | `dev` | `pytest`, `pytest-asyncio`, `ruff`, `mypy`, `pymupdf` |
+
+The `local` extra downloads its model on first use (about 130 MB, cached
+afterwards) — models are tens of megabytes and belong on the machine,
+not in a wheel.
 
 OCR with `OCR_PROVIDER=tesseract` also needs the Tesseract binary on
 `PATH` (`brew install tesseract`, `apt install tesseract-ocr`).

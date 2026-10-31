@@ -43,7 +43,7 @@ from atrium.universal_parser import UniversalParser
 
 def get_embedder():
     import os
-    base = os.getenv("OLLAMA_BASE_URL", "http://localhost:11434").rstrip("/").replace("/v1", "")
+    base = os.getenv("EMBED_BASE_URL", "http://localhost:11434").rstrip("/").replace("/v1", "")
     return OpenAICompatibleEmbedder(
         base_url=f"{base}/v1",
         model=os.getenv("EMBED_MODEL", "bge-large-en-v1.5"),

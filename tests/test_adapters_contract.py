@@ -20,6 +20,8 @@ from __future__ import annotations
 
 from unittest.mock import MagicMock, patch
 
+import pytest
+
 from atrium.retrieval import retrieve_with_parent_resolution
 
 # ---------------------------------------------------------------------------
@@ -279,6 +281,113 @@ class TestHelperAdapterInterchangeability:
 # ---------------------------------------------------------------------------
 # Legacy records: corpus without schema_version field is treated as v0.
 # ---------------------------------------------------------------------------
+
+
+class TestSqliteAdapterContract:
+    """The local store has to be interchangeable with the other two.
+
+    It is the default, so a difference between it and Qdrant shows up
+    in every install rather than in the ones that opted into a server.
+    """
+
+    def _record(self, **overrides):
+        from atrium.models import ChunkRecord, SourceMetadata
+
+        payload = {
+            "doc_id": "doc1",
+            "chunk_id": "c1",
+            "ingest_run_id": "run1",
+            "text": "hello",
+            "embedding": [1.0, 0.0, 0.0],
+            "element_type": "paragraph",
+            "source": SourceMetadata(file_name="a.pdf", page_number=1),
+            "char_span": (0, 5),
+            "content_hash": "h",
+        }
+        payload.update(overrides)
+        return ChunkRecord(**payload)
+
+    def _store(self, tmp_path):
+        from atrium.local_store import SqliteAdapter
+
+        return SqliteAdapter(path=str(tmp_path / "atrium_local.db"))
+
+    def test_ensure_collection_creates_the_file(self, tmp_path):
+        store = self._store(tmp_path)
+        store.ensure_collection("documents", 3)
+        assert (tmp_path / "atrium_local.db").exists()
+
+    def test_dimension_mismatch_names_both_numbers(self, tmp_path):
+        store = self._store(tmp_path)
+        store.ensure_collection("documents", 3)
+        with pytest.raises(ValueError) as excinfo:
+            store.ensure_collection("documents", 5)
+        message = str(excinfo.value)
+        assert "3" in message and "5" in message
+
+    def test_search_returns_the_helper_hit_shape(self, tmp_path):
+        store = self._store(tmp_path)
+        store.ensure_collection("documents", 3)
+        store.upsert([self._record()])
+        hits = store.search([1.0, 0.0, 0.0], top_k=5)
+        assert len(hits) == 1
+        hit = hits[0]
+        for field in (
+            "id", "score", "text", "doc_id", "chunk_id", "page_number",
+            "section_path", "element_type", "is_parent", "parent_id",
+            "chunking_strategy",
+        ):
+            assert field in hit
+        assert hit["text"] == "hello"
+        assert hit["doc_id"] == "doc1"
+        assert hit["score"] == pytest.approx(1.0, abs=1e-6)
+
+    def test_search_orders_by_score(self, tmp_path):
+        store = self._store(tmp_path)
+        store.ensure_collection("documents", 3)
+        store.upsert([
+            self._record(chunk_id="far", embedding=[0.0, 1.0, 0.0]),
+            self._record(chunk_id="near", embedding=[1.0, 0.0, 0.0]),
+        ])
+        hits = store.search([1.0, 0.0, 0.0], top_k=5)
+        assert [hit["chunk_id"] for hit in hits] == ["near", "far"]
+
+    def test_search_children_excludes_parents(self, tmp_path):
+        store = self._store(tmp_path)
+        store.ensure_collection("documents", 3)
+        store.upsert([
+            self._record(chunk_id="parent", is_parent=True, schema_version=1),
+            self._record(chunk_id="child", is_parent=False, schema_version=1),
+        ])
+        assert len(store.search_children([1.0, 0.0, 0.0], top_k=5)) == 1
+        assert len(store.search([1.0, 0.0, 0.0], top_k=5)) == 2
+
+    def test_retrieve_parents_returns_the_parent_payload(self, tmp_path):
+        store = self._store(tmp_path)
+        store.ensure_collection("documents", 3)
+        store.upsert([self._record(chunk_id="p1", is_parent=True)])
+        parents = store.retrieve_parents(["p1"])
+        assert "p1" in parents
+        assert parents["p1"]["is_parent"] is True
+
+    def test_delete_stale_chunks_removes_the_old_run(self, tmp_path):
+        store = self._store(tmp_path)
+        store.ensure_collection("documents", 3)
+        store.upsert([self._record(chunk_id="old", ingest_run_id="run0")])
+        store.upsert([self._record(chunk_id="new", ingest_run_id="run1")])
+        store.delete_stale_chunks("doc1", "run1")
+        stored = {hit["chunk_id"] for hit in store.search([1.0, 0.0, 0.0], top_k=5)}
+        assert stored == {"new"}
+
+    def test_schema_version_reports_the_corpus_version(self, tmp_path):
+        store = self._store(tmp_path)
+        store.ensure_collection("documents", 3)
+        assert store.collection_schema_version() == 0
+        store.upsert([self._record(schema_version=1)])
+        assert store.collection_schema_version() == 1
+
+    def test_health_is_true_for_a_writable_file(self, tmp_path):
+        assert self._store(tmp_path).health() is True
 
 
 class TestLegacyRecordsNoSchemaVersionField:

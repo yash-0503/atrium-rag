@@ -39,7 +39,7 @@ existing collection surfaces immediately, not on the first ingest.
 """
 from __future__ import annotations
 
-from typing import Optional
+from typing import Any, Optional
 
 from atrium.adapters import OpenAICompatibleEmbedder
 from atrium.config import DEFAULTS, env_int, env_str
@@ -58,37 +58,64 @@ DEFAULT_EMBED_DIM = int(DEFAULTS["EMBED_DIM"])
 
 
 def default_base_url() -> str:
-    """Default OLLAMA_BASE_URL.
+    """Default EMBED_BASE_URL.
 
     `localhost` — not `host.docker.internal`. The old default only
     resolved inside a Docker network, so a developer following the
     README on a laptop got a DNS failure against a service that was
-    running perfectly. Container deployments set OLLAMA_BASE_URL
+    running perfectly. Container deployments set EMBED_BASE_URL
     explicitly (compose `env_file:` or a real environment variable).
     """
-    return env_str("OLLAMA_BASE_URL")
+    return env_str("EMBED_BASE_URL")
 
 
 def build_embedder(
     base_url: Optional[str] = None,
-) -> OpenAICompatibleEmbedder:
+) -> Any:
     """Construct the production embedder from env vars.
+
+    Two providers, chosen by `EMBED_PROVIDER`:
+
+    * `http` (the default) — any OpenAI-compatible `/v1/embeddings`
+      endpoint: Ollama, OpenAI, vLLM, LM Studio, TEI, Together. The
+      base URL is the only thing that differs, and an API key is sent
+      when `EMBED_API_KEY` is set.
+    * `fastembed` — the in-process ONNX embedder from the `local`
+      extra. No server, no key, no network.
 
     `EMBED_MODEL` defaults to `bge-large`. `EMBED_DIM` defaults to
     1024. The dimension is a separate env var (not derived from the
     model name) so an operator with a non-default model can pin the
     dimension explicitly — relying on a model-name → dim lookup would
-    silently produce wrong-dim vectors on Ollama if the local model
-    name doesn't match the registry.
+    silently produce wrong-dim vectors when the local model name does
+    not match the registry.
 
     The /v1 suffix is added if missing: `OpenAICompatibleEmbedder`
-    calls /v1/embeddings but operators typically set OLLAMA_BASE_URL
+    calls /v1/embeddings but operators typically set EMBED_BASE_URL
     to the bare host.
     """
+    from atrium.errors import AtriumSetupError
+
+    provider = (env_str("EMBED_PROVIDER") or "http").strip().lower()
+    if provider in ("fastembed", "local", "in-process", "inprocess"):
+        from atrium.local_embedder import DEFAULT_LOCAL_MODEL, FastEmbedEmbedder
+
+        model = env_str("EMBED_MODEL") or DEFAULT_LOCAL_MODEL
+        return FastEmbedEmbedder(model=model, dim=env_int("EMBED_DIM"))
+
     raw_url = base_url if base_url is not None else default_base_url()
+    if not raw_url.strip():
+        raise AtriumSetupError(
+            "No embedding endpoint is configured.",
+            hints=(
+                "Run `atrium init` to set one up",
+                "Or set EMBED_BASE_URL, EMBED_API_KEY and EMBED_MODEL in .env",
+            ),
+        )
     clean_host = raw_url.replace("/v1", "").rstrip("/")
     return OpenAICompatibleEmbedder(
         base_url=f"{clean_host}/v1",
         model=env_str("EMBED_MODEL"),
         dim=env_int("EMBED_DIM"),
+        api_key=env_str("EMBED_API_KEY"),
     )
