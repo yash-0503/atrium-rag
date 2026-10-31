@@ -77,11 +77,12 @@ _THEME = Theme(
     }
 )
 
-console = Console(theme=_THEME)
+from atrium.ui import THEME, space_status
+console = Console(theme=THEME)
 
 
 def _err_console() -> Console:
-    return Console(theme=_THEME, stderr=True)
+    Console(theme=THEME, stderr=True)
 
 
 
@@ -1088,7 +1089,7 @@ def ingest(
     failures: List[Tuple[str, str]] = []
     started = time.monotonic()
 
-    with console.status("[accent]Ingesting…[/]") as status:
+    with space_status(console, "[accent]Ingesting…[/]") as status:
         for path in files:
             the_doc_id = doc_id if (doc_id and len(files) == 1) else path.stem
             status.update(f"[accent]Ingesting[/] {path.name}")
@@ -1167,7 +1168,7 @@ def search(
                 "Install `atrium-rag[rerank]` or set RERANK_ENABLED=1.[/]",
             )
 
-    with console.status("[accent]Searching…[/]"):
+    with space_status(console, "[accent]Ingesting…[/]"):
         vector = _embed_or_fail(embedder, [query])[0]
         hits = retrieve_and_rerank(
             db, vector, query, k, reranker=reranker,
@@ -1248,7 +1249,7 @@ def reingest(
 
     raw = file_path.read_bytes()
     mime = _detect_mime(raw, file_path.name)
-    with console.status(f"[accent]Re-chunking[/] {file_path.name} → {chunking_mode}"):
+    with space_status(f"[accent]Re-chunking[/] {file_path.name} → {chunking_mode}"):
         result = ingest_document(
             doc_id=doc_id,
             file_bytes=raw,

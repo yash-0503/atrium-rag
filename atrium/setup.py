@@ -2,28 +2,26 @@
 
 A first-run wizard has one job: leave the machine in a state where the
 product works, without the user having to know what a vector database
-is. The old wizard asked for thirty keys in a row and started nothing.
-This one looks at the machine, proposes a configuration, fixes what it
-can, and shows the result before writing anything.
+is. This one looks at the machine, proposes a configuration, and shows
+the result before anything is written.
 
 The flow:
 
-    detect  → what is installed, running, and reachable
-    choose  → a vector store and an embedding provider
-    act     → pull a model, start a container, install an extra —
-              each one behind its own yes/no
-    compose → a .env holding only the keys that differ from the defaults
-    review  → a table of every key, editable, with `back` to any earlier step
-    verify  → a real embedding call and a real store probe
-    summary → what works, what does not, and the next three commands
+    scan     → what is installed, running, and reachable
+    ask      → five short sections: store, embeddings, OCR, rerank, vision
+    review   → a card of the result, then: write it / edit some fields /
+               start over / cancel. Edits redo only the sections you pick.
+    act      → pull a model, start a container, install an extra —
+               each one behind its own yes/no
+    write    → a .env holding the keys that differ from the defaults
+    verify   → a real embedding call and a real store probe
 
-Nothing is written to disk until the review step is accepted, and the
+Nothing is written to disk until the review is accepted, and the
 verification step runs against what was actually written.
 """
 from __future__ import annotations
 
 import json
-import os
 import shutil
 import subprocess
 import sys
@@ -43,8 +41,7 @@ __all__ = [
     "verify",
 ]
 
-# Endpoints worth looking for on a developer's machine. Each one is
-# probed for reachability and for the models it offers.
+# Endpoints worth looking for on a developer's machine.
 CANDIDATE_ENDPOINTS = (
     ("http://localhost:11434/v1", "local server (Ollama-compatible)"),
     ("http://localhost:8000/v1", "local server on :8000"),
@@ -54,12 +51,7 @@ CANDIDATE_ENDPOINTS = (
 
 OPENAI_BASE_URL = "https://api.openai.com/v1"
 
-# The dimensions of the models people actually use. Knowing the
-# dimension saves a question; the verification step catches the ones
-# that are not in here.
-# The options for the switches. Everything the operator can choose is
-# a choice, not a thing to type: a name they have to remember is a
-# question they can get wrong.
+# Everything the operator can choose is a choice, not a thing to type.
 OCR_PROVIDERS = [
     ("rapidocr", "pip-only — no binary to install"),
     ("tesseract", "the Tesseract binary, if it is on PATH"),
@@ -91,6 +83,8 @@ RERANK_MODELS = {
 
 VISION_MODELS = ["minicpm-v4.6:1b", "llama3.2-vision:11b", "qwen2.5vl:7b"]
 
+# The dimensions of the models people actually use. Knowing the
+# dimension saves a question; the verification step catches the rest.
 MODEL_DIMENSIONS = {
     "bge-large": 1024,
     "bge-large-en-v1.5": 1024,
@@ -110,9 +104,8 @@ MODEL_DIMENSIONS = {
     "all-MiniLM-L6-v2": 384,
 }
 
-# Keys that must never be printed. The API key is the only one today,
-# but the list is the place to add the next one.
-SECRET_KEYS = ("EMBED_API_KEY", "COHERE_API_KEY", "API_KEY")
+# Keys that must never be printed.
+SECRET_KEYS = ("EMBED_API_KEY", "COHERE_API_KEY", "API_KEY", "PG_CONN")
 
 
 def redact(values: Dict[str, str]) -> Dict[str, str]:
@@ -164,30 +157,12 @@ class Environment:
         return None
 
 
-
 def brand(console, subtitle: str = "") -> None:
-    """The Atrium header.
-
-    A CLI that prints tables with no name on them looks like output
-    from somewhere else. This is the one line that says which tool it
-    is, and it is the first thing on the screen.
-    """
-    from rich.panel import Panel
-
+    """The Atrium header, animated: this is the first thing `init` shows."""
     from atrium import __version__
+    from atrium.ui import brand as _brand
 
-    body = f"[accent]{__version__}[/]"
-    if subtitle:
-        body += f" [dim]·[/] {subtitle}"
-    console.print(
-        Panel(
-            body,
-            title="[bold accent]atrium[/]",
-            title_align="left",
-            border_style="accent",
-            padding=(0, 1),
-        )
-    )
+    _brand(console, subtitle, __version__, animate=True)
 
 
 def _which(binary: str) -> bool:
@@ -197,10 +172,7 @@ def _which(binary: str) -> bool:
 def _run(cmd: Sequence[str], timeout: int = 10) -> Tuple[int, str]:
     try:
         proc = subprocess.run(
-            list(cmd),
-            capture_output=True,
-            text=True,
-            timeout=timeout,
+            list(cmd), capture_output=True, text=True, timeout=timeout
         )
         return proc.returncode, (proc.stdout or "") + (proc.stderr or "")
     except Exception:
@@ -299,8 +271,9 @@ def embedder_from_values(values: Dict[str, str]):
         return FastEmbedEmbedder(model=model, dim=dim or None)
     from atrium.adapters import OpenAICompatibleEmbedder
 
-    base_url = (values.get("EMBED_BASE_URL") or "").strip()
-    clean = base_url.replace("/v1", "").rstrip("/")
+    clean = (values.get("EMBED_BASE_URL") or "").strip().rstrip("/")
+    if clean.endswith("/v1"):  # strip only a trailing /v1, never one mid-URL
+        clean = clean[:-3].rstrip("/")
     return OpenAICompatibleEmbedder(
         base_url=f"{clean}/v1",
         model=model,
@@ -347,53 +320,70 @@ def verify(values: Dict[str, str]) -> List[Check]:
     """Check the configuration the way a user would experience it.
 
     The embedding check makes a real call and compares the dimension
-    that comes back with the configured one. Listing the models is not
-    enough: a server can be up, offer the model, and still return a
-    different number of dimensions — which shows up much later as
-    nonsense search results.
+    that comes back with the configured one: a server can be up, offer
+    the model, and still return a different number of dimensions, which
+    shows up much later as nonsense search results.
     """
     checks: List[Check] = []
 
-    embedder = embedder_from_values(values)
-    probe = getattr(embedder, "probe", None)
-    if probe is not None:
-        ok, detail = probe()
-    else:
-        ok, detail = embedder.health(), ""
-    checks.append(
-        Check(
-            "embedding endpoint",
-            ok,
-            detail or getattr(embedder, "base_url", "") or getattr(embedder, "model_name", ""),
-            "Run `atrium init` to point at a reachable endpoint",
+    try:
+        embedder = embedder_from_values(values)
+    except Exception as exc:
+        checks.append(
+            Check(
+                "embedding endpoint",
+                False,
+                f"{type(exc).__name__}: {exc}",
+                "Install the extra for this provider, or choose another",
+            )
         )
-    )
+        embedder = None
 
-    if ok:
+    if embedder is not None:
+        probe = getattr(embedder, "probe", None)
         try:
-            vectors = embedder.embed(["atrium"])
-            actual = len(vectors[0]) if vectors else 0
-            expected = int(values.get("EMBED_DIM") or 0)
-            if expected and actual != expected:
+            if probe is not None:
+                ok, detail = probe()
+            else:
+                ok, detail = embedder.health(), ""
+        except Exception as exc:
+            ok, detail = False, f"{type(exc).__name__}: {exc}"
+        checks.append(
+            Check(
+                "embedding endpoint",
+                ok,
+                detail
+                or getattr(embedder, "base_url", "")
+                or getattr(embedder, "model_name", ""),
+                "Run `atrium init` to point at a reachable endpoint",
+            )
+        )
+
+        if ok:
+            try:
+                vectors = embedder.embed(["atrium"])
+                actual = len(vectors[0]) if vectors else 0
+                expected = int(values.get("EMBED_DIM") or 0)
+                if expected and actual != expected:
+                    checks.append(
+                        Check(
+                            "embedding dimension",
+                            False,
+                            f"the model returns {actual} dimensions, EMBED_DIM says {expected}",
+                            f"Set EMBED_DIM={actual} in .env",
+                        )
+                    )
+                else:
+                    checks.append(Check("embedding dimension", True, f"{actual} dimensions"))
+            except Exception as exc:
                 checks.append(
                     Check(
-                        "embedding dimension",
+                        "embedding call",
                         False,
-                        f"the model returns {actual} dimensions, EMBED_DIM says {expected}",
-                        f"Set EMBED_DIM={actual} in .env",
+                        f"{type(exc).__name__}: {exc}",
+                        "Check the model name and the API key",
                     )
                 )
-            else:
-                checks.append(Check("embedding dimension", True, f"{actual} dimensions"))
-        except Exception as exc:
-            checks.append(
-                Check(
-                    "embedding call",
-                    False,
-                    f"{type(exc).__name__}: {exc}",
-                    "Check the model name and the API key",
-                )
-            )
 
     try:
         store = store_from_values(values)
@@ -425,7 +415,7 @@ def verify(values: Dict[str, str]) -> List[Check]:
 
 
 # ---------------------------------------------------------------------------
-# The wizard
+# .env writing
 # ---------------------------------------------------------------------------
 
 
@@ -435,12 +425,11 @@ def _write_env_file(
     defaults: Dict[str, str],
     sources: Optional[Dict[str, str]] = None,
 ) -> None:
-    """Write the configuration, with a line saying where each key came from.
+    """Write the configuration.
 
-    A .env that lists thirty keys is unreadable, so a key is written
-    when it differs from the default *or* when the wizard chose it
-    deliberately — a choice that happens to match the default is still
-    a choice, and the file should show it.
+    A key is written when it differs from the default *or* when the
+    wizard chose it deliberately — a choice that happens to match the
+    default is still a choice, and the file should show it.
     """
     sources = sources or {}
     lines = [
@@ -458,10 +447,12 @@ def _write_env_file(
     path.write_text("\n".join(lines) + "\n", encoding="utf-8")
 
 
+# ---------------------------------------------------------------------------
+# Small helpers
+# ---------------------------------------------------------------------------
 
-# Names that suggest a model embeds text. A server usually serves
-# chat and vision models too, and offering those as embedding models
-# is a trap: the request fails at the first embed, minutes later.
+# A server usually serves chat and vision models too; offering those as
+# embedding models is a trap that only shows up at the first embed.
 _EMBEDDING_HINTS = (
     "embed", "bge", "e5", "gte", "minilm", "mxbai", "paraphrase",
     "snowflake", "labse", "jina", "voyage",
@@ -473,9 +464,7 @@ def _looks_like_embedder(name: str) -> bool:
     return any(hint in lowered for hint in _EMBEDDING_HINTS)
 
 
-
 def _is_local_url(url: str) -> bool:
-    """Is this URL pointing at this machine?"""
     lowered = (url or "").lower()
     return any(
         host in lowered
@@ -483,21 +472,23 @@ def _is_local_url(url: str) -> bool:
     )
 
 
+def _on(value) -> bool:
+    return str(value or "0").strip().lower() in ("1", "true", "yes", "on")
+
+
 def _dimension_for(model: str, existing: Dict[str, str]) -> str:
     """The dimension of a model, asking only when it is not known.
 
-    Most people know the model name and not the dimension, and the
-    dimension is what has to be right — so it is looked up, and asked
-    for only when the lookup cannot answer.
+    A previously configured dimension is reused only for the *same*
+    model: a different, unknown model may have a different width.
     """
     name = (model or "").strip()
     bare = name.split(":")[0]
     for candidate in (name, bare, bare.lower(), name.lower()):
         if candidate in MODEL_DIMENSIONS:
             return str(MODEL_DIMENSIONS[candidate])
-    known = existing.get("EMBED_DIM")
-    if known:
-        return known
+    if existing.get("EMBED_DIM") and existing.get("EMBED_MODEL") == name:
+        return existing["EMBED_DIM"]
     import typer
 
     return str(typer.prompt("Dimensions", default="1024"))
@@ -508,117 +499,22 @@ def _menu(
     title: str,
     options: List[Tuple[str, str]],
     allow_other: bool = False,
-    default: str = "1",
+    current: Optional[str] = None,
 ) -> str:
-    """A menu the operator moves through, not one they type at.
+    """An arrow-key menu that returns the chosen label.
 
-    Arrow keys move the cursor, Enter chooses, and a digit jumps
-    straight to an entry. When the input is not a terminal — CI, a
-    pipe — it falls back to typing a number, because a menu that
-    needs a keyboard is no use to a script.
+    `current` preselects an entry, so editing a section starts from
+    what is already configured. Drawing and key handling live in
+    atrium.ui, which also falls back to a numbered prompt when stdin is
+    not a terminal.
     """
-    import sys
-
-    import typer
+    from atrium import ui
 
     choices = list(options)
     if allow_other:
         choices.append(("type another name", "anything else"))
-
-    if not sys.stdin.isatty():
-        console.print()
-        console.print(f"[bold]{title}[/]")
-        for index, (key, note) in enumerate(choices, start=1):
-            console.print(f"  [dim]{index}.[/] {key:<34} [dim]{note}[/]")
-        raw = typer.prompt("\u203a", default=default).strip()
-        index = _safe_index(raw, len(choices)) - 1
-        if allow_other and index == len(choices) - 1:
-            return typer.prompt("name", default="").strip()
-        return choices[max(0, min(index, len(choices) - 1))][0]
-
-    return _menu_tty(title, choices, allow_other)
-
-
-def _menu_tty(
-    title: str,
-    choices: List[Tuple[str, str]],
-    allow_other: bool,
-) -> str:
-    """The arrow-key menu, drawn in place.
-
-    Written with plain ANSI rather than rich, because the cursor has to
-    be moved and the lines redrawn between keypresses, and rich's
-    output model is a stream, not a screen.
-    """
-    import os
-    import sys
-    import termios
-    import tty
-
-    index = 0
-    drawn = 0
-
-    # Every line has to fit the terminal. A line that wraps occupies
-    # two rows, and "move the cursor up one line" then moves up one
-    # *row*, not one line — which is how a menu ends up walking down
-    # the screen instead of redrawing in place.
-    import shutil
-
-    width = max(40, shutil.get_terminal_size((80, 24)).columns)
-    key_width = min(30, max(12, width // 3))
-    note_width = max(8, width - key_width - 6)
-
-    def render() -> None:
-        nonlocal drawn
-        if drawn:
-            sys.stdout.write(f"\x1b[{drawn}A\x1b[J")
-        lines = [f"\x1b[1m{title}\x1b[0m"]
-        for position, (key, note) in enumerate(choices):
-            marker = "\x1b[36m\u276f\x1b[0m" if position == index else " "
-            weight = "\x1b[1m" if position == index else ""
-            shown = key[:key_width].ljust(key_width)
-            detail = note[:note_width]
-            lines.append(
-                f" {marker} {weight}{shown}\x1b[0m \x1b[2m{detail}\x1b[0m"
-            )
-        lines.append(" \x1b[2m\u2191\u2193 to move \u00b7 enter to choose\x1b[0m")
-        sys.stdout.write("\n".join(lines) + "\n")
-        sys.stdout.flush()
-        drawn = len(lines)
-
-    fd = sys.stdin.fileno()
-    saved = termios.tcgetattr(fd)
-    try:
-        tty.setraw(fd)
-        render()
-        while True:
-            char = os.read(fd, 1)
-            if char in (b"\r", b"\n"):
-                break
-            if char == b"\x03" or char == b"\x04":
-                raise KeyboardInterrupt
-            if char == b"\x1b":
-                sequence = os.read(fd, 2)
-                if sequence == b"[A":
-                    index = (index - 1) % len(choices)
-                elif sequence == b"[B":
-                    index = (index + 1) % len(choices)
-                elif sequence == b"[C":
-                    index = (index + 1) % len(choices)
-                elif sequence == b"[D":
-                    index = (index - 1) % len(choices)
-            elif char.isdigit():
-                number = int(char)
-                if 1 <= number <= len(choices):
-                    index = number - 1
-            else:
-                continue
-            render()
-    finally:
-        termios.tcsetattr(fd, termios.TCSADRAIN, saved)
-        sys.stdout.write("\n")
-        sys.stdout.flush()
-
+    default = next((i for i, (key, _) in enumerate(choices) if key == current), 0)
+    index = ui.select(console, title, choices, default)
     if allow_other and index == len(choices) - 1:
         import typer
 
@@ -626,146 +522,152 @@ def _menu_tty(
     return choices[index][0]
 
 
+def _yes_no(console, title: str, default: bool = False, hint: str = "") -> bool:
+    from atrium import ui
 
-def _summary_line(values: Dict[str, str]) -> List[Tuple[str, str]]:
-    """The handful of settings worth showing at a glance.
+    options = [("Yes", hint), ("No", "")]
+    return ui.select(console, title, options, 0 if default else 1) == 0
 
-    Forty-five keys is a configuration dump. These five are the shape
-    of the installation, and the rest is detail.
+
+# ---------------------------------------------------------------------------
+# The questions, one method per section
+# ---------------------------------------------------------------------------
+
+_SECTION_NAMES = ["Vector store", "Embeddings", "OCR", "Reranking", "Vision"]
+
+
+class _Wizard:
+    """The state of one wizard run, and the five sections that fill it.
+
+    Seeded from the existing file, so re-running never silently drops a
+    setting the operator made. Each section overwrites only its keys.
     """
-    store = values.get("VECTOR_DB", "sqlite")
-    store_note = {
-        "sqlite": f"a local file ({values.get('LOCAL_DB_PATH', 'atrium_local.db')})",
-        "qdrant": f"{values.get('QDRANT_HOST', 'localhost')}:{values.get('QDRANT_PORT', '6333')}",
-        "pgvector": "postgres",
-    }.get(store, store)
 
-    provider = values.get("EMBED_PROVIDER", "http")
-    if provider == "fastembed":
-        embeddings = (
-            f"{values.get('EMBED_MODEL', '?')} \u00b7 {values.get('EMBED_DIM', '?')}-d "
-            "\u00b7 in-process"
-        )
-    else:
-        embeddings = (
-            f"{values.get('EMBED_BASE_URL', '?')} \u00b7 "
-            f"{values.get('EMBED_MODEL', '?')} \u00b7 {values.get('EMBED_DIM', '?')}-d"
-        )
-
-    def _on(key: str) -> bool:
-        return str(values.get(key, "0")).lower() in ("1", "true", "yes", "on")
-
-    ocr = (
-        "off"
-        if not _on("OCR_ENABLED")
-        else f"{values.get('OCR_PROVIDER', 'tesseract')} \u00b7 {values.get('OCR_LANG', 'eng')}"
-    )
-    rerank = (
-        "off"
-        if not _on("RERANK_ENABLED")
-        else f"{values.get('RERANK_PROVIDER', 'bge')} \u00b7 "
-             f"{values.get('RERANK_MODEL', '') or 'default'}"
-    )
-    vision = "off" if not _on("VISION_ENABLED") else values.get("VISION_MODEL", "minicpm-v4.6:1b")
-    return [
-        ("store", store_note),
-        ("embeddings", embeddings),
-        ("ocr", ocr),
-        ("rerank", rerank),
-        ("vision", vision),
-    ]
-
-
-def _ask_interactive(
-    env: Environment,
-    existing: Dict[str, str],
-    set_value,
-    console,
-) -> None:
-    """Six questions, most of them a single keypress.
-
-    The order follows the dependencies: the store decides whether a
-    host and a port are needed at all, and the embedding provider
-    decides whether a key is needed at all. Nothing is asked that has a
-    good default, nothing is asked twice, and every choice that has a
-    list of possible answers is a list the operator picks from.
-    """
-    import typer
-
-    # -- the vector store ------------------------------------------------
-    store = _menu(
+    def __init__(
+        self,
+        env: Environment,
+        existing: Dict[str, str],
         console,
-        "Vector store",
-        [
-            ("sqlite", "a local file \u2014 nothing to install"),
-            ("qdrant", "a running Qdrant server"),
-            ("pgvector", "Postgres with the pgvector extension"),
-        ],
-    )
-    set_value("VECTOR_DB", store, "chosen")
-    if store == "qdrant":
-        set_value(
-            "QDRANT_HOST",
-            typer.prompt("Host", default=existing.get("QDRANT_HOST", "localhost")),
-            "chosen",
-        )
-        set_value(
-            "QDRANT_PORT",
-            str(typer.prompt("Port", default=existing.get("QDRANT_PORT", "6333"))),
-            "chosen",
-        )
-    elif store == "pgvector":
-        set_value(
-            "PG_CONN",
-            typer.prompt("Postgres DSN", default=existing.get("PG_CONN", "")),
-            "chosen",
-        )
-    else:
-        set_value(
-            "LOCAL_DB_PATH",
-            existing.get("LOCAL_DB_PATH", "atrium_local.db"),
-            "default",
-        )
+        defaults: Optional[Dict[str, str]] = None,
+    ) -> None:
+        self.env = env
+        self.defaults = dict(defaults or {})
+        self.existing = dict(existing)
+        self.console = console
+        self.values: Dict[str, str] = dict(existing)
+        self.sources: Dict[str, str] = {key: "existing" for key in existing}
 
-    # -- the embedding provider ------------------------------------------
-    provider = _menu(
-        console,
-        "Embeddings",
-        [
-            ("local server", "Ollama, LM Studio, vLLM, TEI"),
-            ("OpenAI", "api.openai.com"),
-            ("another server", "any OpenAI-compatible /v1"),
-            ("in-process", "fastembed \u2014 no server at all"),
-        ],
-    )
+    # -- state ------------------------------------------------------------
 
-    if provider == "in-process":
-        set_value("EMBED_PROVIDER", "fastembed", "chosen")
-        set_value("EMBED_MODEL", "BAAI/bge-small-en-v1.5", "chosen")
-        set_value("EMBED_DIM", "384", "chosen")
-    else:
-        set_value("EMBED_PROVIDER", "http", "chosen")
-        if provider == "OpenAI":
-            base_url = OPENAI_BASE_URL
-            needs_key = True
-        elif provider == "another server":
-            base_url = typer.prompt(
-                "Base URL",
-                default=existing.get("EMBED_BASE_URL", "http://localhost:11434/v1"),
+    def cur(self, key: str, default: str = "") -> str:
+        """The value being edited, else the one from the file, else a default."""
+        if key in self.values and self.values[key] != "":
+            return self.values[key]
+        if key in self.existing and self.existing[key] != "":
+            return self.existing[key]
+        return self.defaults.get(key, default)
+
+    def set(self, key: str, value: str, source: str = "you") -> None:
+        self.values[key] = value
+        self.sources[key] = source
+
+    def drop(self, *keys: str) -> None:
+        """Remove stale provider-specific keys when switching backends."""
+        for k in keys:
+            self.values.pop(k, None)
+            self.sources.pop(k, None)
+
+    def reset(self) -> None:
+        self.values = dict(self.existing)
+        self.sources = {key: "existing" for key in self.existing}
+
+    # -- sections ---------------------------------------------------------
+
+    def ask_store(self) -> None:
+        import typer
+
+        store = _menu(
+            self.console,
+            "Vector store",
+            [
+                ("sqlite", "a local file — nothing to install"),
+                ("qdrant", "a running Qdrant server"),
+                ("pgvector", "Postgres with the pgvector extension"),
+            ],
+            current=self.cur("VECTOR_DB", "sqlite"),
+        )
+        self.set("VECTOR_DB", store, "chosen")
+        if store == "qdrant":
+            self.drop("PG_CONN", "LOCAL_DB_PATH")
+            self.set(
+                "QDRANT_HOST",
+                typer.prompt("Host", default=self.cur("QDRANT_HOST", "localhost")),
+                "chosen",
             )
+            self.set(
+                "QDRANT_PORT",
+                str(typer.prompt("Port", default=self.cur("QDRANT_PORT", "6333"))),
+                "chosen",
+            )
+        elif store == "pgvector":
+            self.drop("QDRANT_HOST", "QDRANT_PORT", "LOCAL_DB_PATH")
+            self.set(
+                "PG_CONN",
+                typer.prompt("Postgres DSN", default=self.cur("PG_CONN")),
+                "chosen",
+            )
+        else:
+            self.drop("QDRANT_HOST", "QDRANT_PORT", "PG_CONN")
+            self.set("LOCAL_DB_PATH", self.cur("LOCAL_DB_PATH", "atrium_local.db"), "default")
+
+    def ask_embeddings(self) -> None:
+        import typer
+
+        console, env = self.console, self.env
+
+        base_now = self.cur("EMBED_BASE_URL")
+        if self.cur("EMBED_PROVIDER", "http") == "fastembed":
+            current = "in-process"
+        elif base_now == OPENAI_BASE_URL:
+            current = "OpenAI"
+        elif base_now and not _is_local_url(base_now):
+            current = "another server"
+        else:
+            current = "local server"
+
+        provider = _menu(
+            console,
+            "Embeddings",
+            [
+                ("local server", "Ollama, LM Studio, vLLM, TEI"),
+                ("OpenAI", "api.openai.com"),
+                ("another server", "any OpenAI-compatible /v1"),
+                ("in-process", "fastembed — no server at all"),
+            ],
+            current=current,
+        )
+
+        if provider == "in-process":
+            self.drop("EMBED_BASE_URL", "EMBED_API_KEY")
+            self.set("EMBED_PROVIDER", "fastembed", "chosen")
+            self.set("EMBED_MODEL", "BAAI/bge-small-en-v1.5", "chosen")
+            self.set("EMBED_DIM", "384", "chosen")
+            return
+
+        self.set("EMBED_PROVIDER", "http", "chosen")
+        if provider == "OpenAI":
+            base_url, needs_key = OPENAI_BASE_URL, True
+        elif provider == "another server":
+            default_url = base_now if (base_now and base_now != OPENAI_BASE_URL) else "http://localhost:11434/v1"
+            base_url = typer.prompt("Base URL", default=default_url)
             needs_key = not _is_local_url(base_url)
         else:
-            detected = (
-                env.endpoints[0].base_url if env.endpoints else "http://localhost:11434/v1"
-            )
-            base_url = typer.prompt(
-                "Base URL", default=existing.get("EMBED_BASE_URL", detected)
-            )
+            detected = env.endpoints[0].base_url if env.endpoints else "http://localhost:11434/v1"
+            default_url = base_now if (base_now and _is_local_url(base_now)) else detected
+            base_url = typer.prompt("Base URL", default=default_url)
             needs_key = not _is_local_url(base_url)
-        set_value("EMBED_BASE_URL", base_url, "chosen")
+        self.set("EMBED_BASE_URL", base_url, "chosen")
 
-        # The models the endpoint actually offers, so the model is
-        # picked rather than typed.
         models: List[str] = []
         probed = _probe_endpoint(base_url)
         if probed is not None:
@@ -791,227 +693,321 @@ def _ask_interactive(
                     ("text-embedding-3-small", 1536),
                 )
             ]
-        model = _menu(console, "Model", options, allow_other=True)
+        model = _menu(
+            console, "Model", options, allow_other=True, current=self.cur("EMBED_MODEL")
+        )
         if others:
             console.print(
                 "  [dim]also on this server, but not embedding models: "
                 + ", ".join(others[:6]) + "[/]"
             )
-        set_value("EMBED_MODEL", model, "chosen")
-        set_value("EMBED_DIM", _dimension_for(model, existing), "chosen")
+        # Pass self.values so in-session dimension edits are preserved
+        dim = _dimension_for(model, self.values)
+        self.set("EMBED_MODEL", model, "chosen")
+        self.set("EMBED_DIM", dim, "chosen")
 
         if needs_key:
-            set_value(
+            self.set(
                 "EMBED_API_KEY",
-                typer.prompt(
-                    "API key", default=existing.get("EMBED_API_KEY", ""), hide_input=True
+                typer.prompt("API key", default=self.cur("EMBED_API_KEY"), hide_input=True),
+                "chosen",
+            )
+        else:
+            self.drop("EMBED_API_KEY")
+
+    def ask_ocr(self) -> None:
+        if _yes_no(
+            self.console,
+            "Enable OCR for scanned pages?",
+            _on(self.cur("OCR_ENABLED")),
+            "read text from scans and image-only documents",
+        ):
+            self.set("OCR_ENABLED", "1", "chosen")
+            self.set(
+                "OCR_PROVIDER",
+                _menu(self.console, "OCR engine", OCR_PROVIDERS,
+                      current=self.cur("OCR_PROVIDER", "rapidocr")),
+                "chosen",
+            )
+            self.set(
+                "OCR_LANG",
+                _menu(self.console, "OCR language", OCR_LANGUAGES, allow_other=True,
+                      current=self.cur("OCR_LANG", "eng")),
+                "chosen",
+            )
+        else:
+            self.set("OCR_ENABLED", "0", "chosen")
+
+    def ask_rerank(self) -> None:
+        import typer
+
+        if _yes_no(
+            self.console,
+            "Enable cross-encoder reranking?",
+            _on(self.cur("RERANK_ENABLED")),
+            "re-score results: slower, more accurate",
+        ):
+            self.set("RERANK_ENABLED", "1", "chosen")
+            provider = _menu(
+                self.console, "Rerank engine", RERANK_PROVIDERS,
+                current=self.cur("RERANK_PROVIDER", "bge"),
+            )
+            self.set("RERANK_PROVIDER", provider, "chosen")
+            self.set(
+                "RERANK_MODEL",
+                _menu(
+                    self.console,
+                    "Rerank model",
+                    [(name, "") for name in RERANK_MODELS.get(provider, [])],
+                    allow_other=True,
+                    current=self.cur("RERANK_MODEL"),
                 ),
                 "chosen",
             )
+            if provider == "cohere":
+                self.set(
+                    "COHERE_API_KEY",
+                    typer.prompt(
+                        "Cohere API key",
+                        default=self.cur("COHERE_API_KEY"),
+                        hide_input=True,
+                    ),
+                    "chosen",
+                )
+        else:
+            self.set("RERANK_ENABLED", "0", "chosen")
 
-    # -- OCR ---------------------------------------------------------------
-    if typer.confirm("Enable OCR for scanned pages?", default=False):
-        set_value("OCR_ENABLED", "1", "chosen")
-        ocr_provider = _menu(console, "OCR provider", OCR_PROVIDERS)
-        set_value("OCR_PROVIDER", ocr_provider, "chosen")
-        language = _menu(console, "OCR language", OCR_LANGUAGES, allow_other=True)
-        set_value("OCR_LANG", language, "chosen")
-    else:
-        set_value("OCR_ENABLED", "0", "chosen")
-
-    # -- reranking ---------------------------------------------------------
-    if typer.confirm("Enable cross-encoder reranking?", default=False):
-        set_value("RERANK_ENABLED", "1", "chosen")
-        rerank_provider = _menu(console, "Rerank provider", RERANK_PROVIDERS)
-        set_value("RERANK_PROVIDER", rerank_provider, "chosen")
-        model = _menu(
-            console,
-            "Rerank model",
-            [(name, "") for name in RERANK_MODELS.get(rerank_provider, [])],
-            allow_other=True,
-        )
-        set_value("RERANK_MODEL", model, "chosen")
-        if rerank_provider == "cohere":
-            set_value(
-                "COHERE_API_KEY",
-                typer.prompt(
-                    "Cohere API key",
-                    default=existing.get("COHERE_API_KEY", ""),
-                    hide_input=True,
+    def ask_vision(self) -> None:
+        if _yes_no(
+            self.console,
+            "Enable vision models for images?",
+            _on(self.cur("VISION_ENABLED")),
+            "describe images with a vision model",
+        ):
+            self.set("VISION_ENABLED", "1", "chosen")
+            self.set(
+                "VISION_MODEL",
+                _menu(
+                    self.console,
+                    "Vision model",
+                    [(name, "") for name in VISION_MODELS],
+                    allow_other=True,
+                    current=self.cur("VISION_MODEL"),
                 ),
                 "chosen",
             )
+        else:
+            self.set("VISION_ENABLED", "0", "chosen")
+
+    def sections(self):
+        return [
+            self.ask_store,
+            self.ask_embeddings,
+            self.ask_ocr,
+            self.ask_rerank,
+            self.ask_vision,
+        ]
+
+    def ask_all(self) -> None:
+        for ask in self.sections():
+            ask()
+
+
+# ---------------------------------------------------------------------------
+# Review
+# ---------------------------------------------------------------------------
+
+_SECTION_KEYS = {
+    "VECTOR_DB", "LOCAL_DB_PATH", "QDRANT_HOST", "QDRANT_PORT", "PG_CONN",
+    "EMBED_PROVIDER", "EMBED_BASE_URL", "EMBED_MODEL", "EMBED_DIM", "EMBED_API_KEY",
+    "OCR_ENABLED", "OCR_PROVIDER", "OCR_LANG",
+    "RERANK_ENABLED", "RERANK_PROVIDER", "RERANK_MODEL", "COHERE_API_KEY",
+    "VISION_ENABLED", "VISION_MODEL",
+}
+
+
+def _review_sections(values: Dict[str, str]):
+    """The configuration as human-readable sections (secrets hidden)."""
+
+    def g(key: str, default: str = "") -> str:
+        return values.get(key) or default
+
+    store = g("VECTOR_DB", "sqlite")
+    if store == "qdrant":
+        store_rows = [
+            ("Backend", "Qdrant"),
+            ("Address", f"{g('QDRANT_HOST', 'localhost')}:{g('QDRANT_PORT', '6333')}"),
+        ]
+    elif store == "pgvector":
+        store_rows = [
+            ("Backend", "Postgres + pgvector"),
+            ("Connection", "set (hidden)" if g("PG_CONN") else "not set"),
+        ]
     else:
-        set_value("RERANK_ENABLED", "0", "chosen")
+        store_rows = [
+            ("Backend", "SQLite (local file)"),
+            ("File", g("LOCAL_DB_PATH", "atrium_local.db")),
+        ]
 
-    # -- vision ------------------------------------------------------------
-    if typer.confirm("Enable vision models for images?", default=False):
-        set_value("VISION_ENABLED", "1", "chosen")
-        model = _menu(
-            console,
-            "Vision model",
-            [(name, "") for name in VISION_MODELS],
-            allow_other=True,
-        )
-        set_value("VISION_MODEL", model, "chosen")
+    if g("EMBED_PROVIDER", "http") == "fastembed":
+        emb_rows = [
+            ("Provider", "in-process (fastembed)"),
+            ("Model", g("EMBED_MODEL", "?")),
+            ("Dimensions", g("EMBED_DIM", "?")),
+        ]
     else:
-        set_value("VISION_ENABLED", "0", "chosen")
+        emb_rows = [
+            ("Provider", "OpenAI-compatible endpoint"),
+            ("Endpoint", g("EMBED_BASE_URL", "?")),
+            ("Model", g("EMBED_MODEL", "?")),
+            ("Dimensions", g("EMBED_DIM", "?")),
+            ("API key", "set (hidden)" if g("EMBED_API_KEY") else "not set"),
+        ]
 
+    if _on(values.get("OCR_ENABLED")):
+        ocr_rows = [
+            ("Status", "on"),
+            ("Engine", g("OCR_PROVIDER", "rapidocr")),
+            ("Language", g("OCR_LANG", "eng")),
+        ]
+    else:
+        ocr_rows = [("Status", "off")]
 
-def _review_table(values: Dict[str, str], sources: Dict[str, str]) -> str:
-    """What the installation will look like, in two blocks.
+    if _on(values.get("RERANK_ENABLED")):
+        rerank_rows = [
+            ("Status", "on"),
+            ("Engine", g("RERANK_PROVIDER", "bge")),
+            ("Model", g("RERANK_MODEL", "default")),
+        ]
+    else:
+        rerank_rows = [("Status", "off")]
 
-    The first block is the shape of the thing — store, embeddings,
-    OCR, rerank, vision. The second is the keys this run actually set.
-    The forty other keys in the file are listed as a count, because a
-    list of forty-five is not information anyone can act on.
-    """
-    interesting = {
-        key: value
-        for key, value in values.items()
-        if sources.get(key, "existing") != "existing"
-    }
-    lines = []
-    for label, note in _summary_line(values):
-        lines.append(f"  {label:<12} {note}")
+    if _on(values.get("VISION_ENABLED")):
+        vision_rows = [("Status", "on"), ("Model", g("VISION_MODEL", "minicpm-v4.6:1b"))]
+    else:
+        vision_rows = [("Status", "off")]
 
-    if interesting:
-        lines.append("")
-        width = max(len(key) for key in interesting) + 2
-        for key, value in interesting.items():
-            shown = value if value else "(unset)"
-            if key in SECRET_KEYS and value:
-                shown = "set (hidden)"
-            lines.append(f"  {key:<{width}} {shown}")
+    sections = [
+        (_SECTION_NAMES[0], store_rows),
+        (_SECTION_NAMES[1], emb_rows),
+        (_SECTION_NAMES[2], ocr_rows),
+        (_SECTION_NAMES[3], rerank_rows),
+        (_SECTION_NAMES[4], vision_rows),
+    ]
 
-    others = len(values) - len(interesting)
+    others = [key for key in values if key not in _SECTION_KEYS]
     if others:
-        lines.append("")
-        lines.append(f"  [+ {others} other setting(s) already in .env, unchanged]")
+        sections.append(
+            ("Other", [("Kept from .env", f"{len(others)} setting(s), unchanged")])
+        )
+    return sections
 
-    lines.append("")
-    lines.append("  set KEY VALUE   change a value")
-    lines.append("  unset KEY       remove a key")
-    lines.append("  edit            open this file in $EDITOR")
-    lines.append("  save            write it and continue")
-    return "\n".join(lines)
 
-def run_wizard(
-    target: Path,
-    *,
-    defaults: Dict[str, str],
-    existing: Dict[str, str],
-    non_interactive: bool = False,
-    assume_yes: bool = False,
-    force: bool = False,
-    as_json: bool = False,
-    console=None,
-    err_console=None,
-) -> int:
-    """Run the wizard. Returns a process exit code."""
-    from rich.table import Table
+def _section_hint(sections, index: int) -> str:
+    """A one-line summary of a section, for the edit checklist."""
+    _, rows = sections[index]
+    return " · ".join(value for _, value in rows[:3])
 
-    console = console or _console()
-    err_console = err_console or _err_console()
 
-    # Seeded from the existing file, so re-running the wizard never
-    # silently drops a setting the operator made. The choices below
-    # overwrite the keys they are about; everything else is left alone.
-    values: Dict[str, str] = dict(existing)
-    sources: Dict[str, str] = {key: "existing" for key in existing}
+def _edit_single_key(w: _Wizard, console) -> None:
+    """Pick any setting by name and give it a new value."""
+    import typer
 
-    def set_value(key: str, value: str, source: str = "you") -> None:
-        values[key] = value
-        sources[key] = source
+    from atrium import ui
 
-    # -- 1. what is on this machine ---------------------------------------
-    # Detection is used to fill in the defaults and to offer the setup
-    # actions below. It is not shown: the operator came here to answer
-    # a few questions, not to read a report about their own laptop.
-    env = detect_environment()
-
-    if non_interactive:
-        _choose_non_interactive(env, existing, set_value)
+    # Include all known section keys, defaults, and current values so every field is editable
+    all_keys = sorted(set(_SECTION_KEYS) | set(w.defaults) | set(w.values))
+    options = [
+        (
+            key,
+            "set (hidden)"
+            if key in SECRET_KEYS and w.cur(key)
+            else (w.cur(key) or "not set"),
+        )
+        for key in all_keys
+    ]
+    options.append(("type another key", "any setting atrium reads"))
+    index = ui.select(console, "Which setting?", options)
+    if index == len(options) - 1:
+        key = typer.prompt("Key").strip().upper()
     else:
+        key = all_keys[index]
+    if not key:
+        return
+    value = typer.prompt(
+        key, default=w.cur(key, ""), hide_input=key in SECRET_KEYS
+    )
+    w.set(key, str(value).strip(), "you")
+
+
+def _review_loop(w: _Wizard, target: Path, console) -> bool:
+    """Show the result, and let the operator accept, edit, restart or cancel.
+
+    Returns True when the configuration should be written.
+    """
+    from atrium import ui
+
+    first = True
+    while True:
         console.print()
-        brand(console, f"setting up {target}")
-        _ask_interactive(env, existing, set_value, console)
-
-    # -- 4. actions -------------------------------------------------------
-    if not non_interactive:
-        _offer_actions(env, values, sources, assume_yes, console)
-
-    # -- 5. review --------------------------------------------------------
-    if non_interactive:
-        target_values = dict(values)
-    else:
-        target_values = _review_loop(values, sources, target, console, err_console)
-        if target_values is None:
-            err_console.print("[bad]Setup cancelled.[/] Nothing was written.")
-            return 1
-
-    # -- 6. write and verify ---------------------------------------------
-    _write_env_file(target, target_values, defaults, sources)
-    console.print(f"[ok]Wrote[/] {target}")
-
-    checks = verify(target_values)
-    ok = all(check.ok for check in checks)
-
-    if as_json:
-        console.print(
-            json.dumps(
-                {
-                    "env": str(target),
-                    "values": redact(target_values),
-                    "checks": [
-                        {"name": c.name, "ok": c.ok, "detail": c.detail, "fix": c.fix}
-                        for c in checks
-                    ],
-                    "ok": ok,
-                },
-                indent=2,
+        sections = _review_sections(w.values)
+        ui.review_card(console, sections, title=f"Review · {target}", animate=first)
+        first = False
+        console.print()
+        try:
+            choice = ui.select(
+                console,
+                "Write this configuration?",
+                [
+                    ("Yes, write it", f"save to {target.name} and verify"),
+                    ("Edit some fields", "change one or more sections"),
+                    ("Start over", "go back to the first question"),
+                    ("No, cancel", "write nothing"),
+                ],
             )
-        )
-        return 0 if ok else 1
+        except KeyboardInterrupt:
+            return False
 
-    table = Table(title=None, show_header=True, header_style="dim")
-    table.add_column("check")
-    table.add_column("status")
-    table.add_column("detail")
-    for check in checks:
-        table.add_row(
-            check.name,
-            "[ok]ok[/]" if check.ok else "[bad]failed[/]",
-            check.detail,
-        )
-    console.print()
-    console.print(table)
+        if choice == 0:
+            return True
+        if choice == 3:
+            return False
+        if choice == 2:
+            w.reset()
+            console.print()
+            try:
+                w.ask_all()
+            except KeyboardInterrupt:
+                return False
+            continue
 
-    if ok:
+        # -- edit some fields ---------------------------------------------
         console.print()
-        console.print("[ok]Everything checks out.[/]")
-        console.print(
-            "[dim]Next:[/] [key]atrium demo[/] to see it work, "
-            "or [key]atrium serve[/] to run the API."
-        )
-    else:
-        err_console.print()
-        err_console.print("[bad]Some checks failed.[/] The configuration was still written:")
-        for check in checks:
-            if not check.ok and check.fix:
-                err_console.print(f"  [key]{check.name}[/] — {check.fix}")
-        err_console.print(
-            "[dim]Edit the file and run[/] [key]atrium doctor[/] [dim]to re-check.[/]"
-        )
-    return 0 if ok else 1
+        names = [
+            (name, _section_hint(sections, i)) for i, name in enumerate(_SECTION_NAMES)
+        ]
+        names.append(("An individual setting", "change any key by name"))
+        try:
+            picked = ui.multiselect(console, "What do you want to change?", names)
+            asks = w.sections()
+            for i in picked:
+                if i < len(asks):
+                    console.print()
+                    asks[i]()
+            if len(asks) in picked:
+                console.print()
+                _edit_single_key(w, console)
+        except KeyboardInterrupt:
+            continue  # back to the review
 
 
-def _choose_non_interactive(
-    env: Environment, existing: Dict[str, str], set_value
-) -> None:
+# ---------------------------------------------------------------------------
+# Non-interactive and setup actions
+# ---------------------------------------------------------------------------
+
+
+def _choose_non_interactive(env: Environment, existing: Dict[str, str], set_value) -> None:
     """Pick the best configuration the machine already offers."""
-    # The store: the local one needs nothing, so it is the default; a
-    # reachable Qdrant is worth using when it is already there.
     if env.qdrant_reachable:
         set_value("VECTOR_DB", "qdrant", "detected")
         set_value("QDRANT_HOST", "localhost", "detected")
@@ -1035,18 +1031,9 @@ def _choose_non_interactive(
     set_value("EMBED_DIM", existing.get("EMBED_DIM", "1024"), "detected")
 
 
-def _safe_index(raw: str, count: int) -> int:
-    try:
-        index = int(str(raw).strip())
-    except (TypeError, ValueError):
-        return 1
-    return max(1, min(index, count))
-
-
 def _offer_actions(
     env: Environment,
     values: Dict[str, str],
-    sources: Dict[str, str],
     assume_yes: bool,
     console,
 ) -> None:
@@ -1055,10 +1042,9 @@ def _offer_actions(
     Every one of them asks first. Nothing on the machine changes
     without the operator saying yes.
     """
-    import typer
 
     def offer(description: str, action) -> bool:
-        approved = True if assume_yes else typer.confirm(description, default=True)
+        approved = True if assume_yes else _yes_no(console, description, True)
         if not approved:
             return False
         try:
@@ -1116,90 +1102,119 @@ def _offer_actions(
         )
 
 
-def _review_loop(
-    values: Dict[str, str],
-    sources: Dict[str, str],
+# ---------------------------------------------------------------------------
+# The wizard
+# ---------------------------------------------------------------------------
+
+
+def run_wizard(
     target: Path,
-    console,
-    err_console,
-):
-    """Show the configuration, let it be changed, and only then write it."""
-    import typer
+    *,
+    defaults: Dict[str, str],
+    existing: Dict[str, str],
+    non_interactive: bool = False,
+    assume_yes: bool = False,
+    force: bool = False,
+    as_json: bool = False,
+    console=None,
+    err_console=None,
+) -> int:
+    """Run the wizard. Returns a process exit code."""
+    from atrium import ui
 
-    while True:
-        console.print()
-        console.print("[bold]Review[/] [dim]— nothing is written until you save[/]")
-        console.print()
-        console.print(_review_table(values, sources))
-        console.print()
+    console = console or _console()
+    err_console = err_console or _err_console()
+
+    if not non_interactive and not as_json:
+        brand(console, f"setting up {target}")
+
+    # Detection fills in defaults and decides which setup actions to
+    # offer. It is not shown as a report: the operator came to answer a
+    # few questions, not to read about their own laptop.
+    if non_interactive:
+        env = detect_environment()
+    else:
+        with ui.space_status(console, "Scanning this machine…"):
+            env = detect_environment()
+
+    w = _Wizard(env, existing, console, defaults=defaults)
+
+    if non_interactive:
+        _choose_non_interactive(env, existing, w.set)
+    else:
         try:
-            raw = typer.prompt("›", default="save", show_default=False)
-        except (EOFError, KeyboardInterrupt):
-            return None
+            w.ask_all()
+            if not _review_loop(w, target, console):
+                err_console.print("[bad]Setup cancelled.[/] Nothing was written.")
+                return 1
+            _offer_actions(env, w.values, assume_yes, console)
+        except KeyboardInterrupt:
+            err_console.print("\n[bad]Setup cancelled.[/] Nothing was written.")
+            return 1
 
-        command = raw.strip()
-        lowered = command.lower()
+    target_values = dict(w.values)
 
-        if lowered in ("save", "s", ""):
-            return values
-        if lowered in ("quit", "q", "cancel"):
-            return None
-        if lowered.startswith("set "):
-            parts = command.split(" ", 2)
-            if len(parts) == 3 and parts[1]:
-                values[parts[1].strip()] = parts[2].strip()
-                sources[parts[1].strip()] = "you"
-                continue
-            err_console.print("[bad]usage: set KEY VALUE[/]")
-            continue
-        if lowered.startswith("unset "):
-            key = command[6:].strip()
-            if key:
-                values.pop(key, None)
-                sources.pop(key, None)
-                continue
-            err_console.print("[bad]usage: unset KEY[/]")
-            continue
-        if lowered == "edit":
-            _edit_in_editor(values)
-            continue
-        err_console.print(f"[bad]unknown command[/] {command!r}")
+    # -- write and verify ---------------------------------------------------
+    _write_env_file(target, target_values, defaults, w.sources)
+    console.print(f"[ok]Wrote[/] {target}")
 
+    with ui.space_status(console, "Verifying…"):
+        checks = verify(target_values)
+    ok = all(check.ok for check in checks)
 
-def _edit_in_editor(values: Dict[str, str]) -> None:
-    """Hand the configuration to the user's editor, then read it back."""
-    import tempfile
+    if as_json:
+        console.print(
+            json.dumps(
+                {
+                    "env": str(target),
+                    "values": redact(target_values),
+                    "checks": [
+                        {"name": c.name, "ok": c.ok, "detail": c.detail, "fix": c.fix}
+                        for c in checks
+                    ],
+                    "ok": ok,
+                },
+                indent=2,
+            )
+        )
+        return 0 if ok else 1
 
-    editor = os.environ.get("EDITOR") or os.environ.get("VISUAL") or "vi"
-    with tempfile.NamedTemporaryFile("w", suffix=".env", delete=False, encoding="utf-8") as fh:
-        for key, value in values.items():
-            fh.write(f"{key}={value}\n")
-        path = fh.name
-    try:
-        subprocess.run([editor, path], check=False)
-        edited: Dict[str, str] = {}
-        for line in Path(path).read_text(encoding="utf-8").splitlines():
-            line = line.strip()
-            if not line or line.startswith("#") or "=" not in line:
-                continue
-            key, _, value = line.partition("=")
-            edited[key.strip()] = value.strip()
-        values.clear()
-        values.update(edited)
-    finally:
-        Path(path).unlink(missing_ok=True)
+    console.print()
+    ui.reveal_checks(console, checks, animate=not non_interactive)
+
+    if ok:
+        console.print()
+        ui.launch_ready(console, "All systems ready")
+        console.print(
+            "[dim]Next:[/] [key]atrium demo[/] to see it work, "
+            "or [key]atrium serve[/] to run the API."
+        )
+    else:
+        err_console.print()
+        err_console.print("[bad]Some checks failed.[/] The configuration was still written:")
+        for check in checks:
+            if not check.ok and check.fix:
+                err_console.print(f"  [key]{check.name}[/] — {check.fix}")
+        err_console.print(
+            "[dim]Edit the file and run[/] [key]atrium doctor[/] [dim]to re-check.[/]"
+        )
+    return 0 if ok else 1
 
 
 def _console():
     from rich.console import Console
 
-    return Console()
+    from atrium.ui import THEME
+
+    return Console(theme=THEME)
 
 
 def _err_console():
     from rich.console import Console
 
-    return Console(stderr=True)
+    from atrium.ui import THEME
+
+    return Console(theme=THEME, stderr=True)
 
 
 def _version() -> str:
