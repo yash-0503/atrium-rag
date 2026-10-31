@@ -53,6 +53,28 @@ CANDIDATE_ENDPOINTS = (
 
 OPENAI_BASE_URL = "https://api.openai.com/v1"
 
+# The dimensions of the models people actually use. Knowing the
+# dimension saves a question; the verification step catches the ones
+# that are not in here.
+MODEL_DIMENSIONS = {
+    "bge-large": 1024,
+    "bge-large-en-v1.5": 1024,
+    "BAAI/bge-large-en-v1.5": 1024,
+    "bge-base": 768,
+    "bge-base-en-v1.5": 768,
+    "BAAI/bge-base-en-v1.5": 768,
+    "bge-small": 384,
+    "bge-small-en-v1.5": 384,
+    "BAAI/bge-small-en-v1.5": 384,
+    "text-embedding-3-small": 1536,
+    "text-embedding-3-large": 3072,
+    "nomic-embed-text": 768,
+    "nomic-embed-text:v1.5": 768,
+    "mxbai-embed-large": 1024,
+    "all-minilm": 384,
+    "all-MiniLM-L6-v2": 384,
+}
+
 # Keys that must never be printed. The API key is the only one today,
 # but the list is the place to add the next one.
 SECRET_KEYS = ("EMBED_API_KEY", "COHERE_API_KEY", "API_KEY")
@@ -392,6 +414,155 @@ def _review_table(values: Dict[str, str], sources: Dict[str, str]) -> str:
     )
 
 
+
+def _dimension_for(model: str, existing: Dict[str, str]) -> str:
+    """The dimension of a model, asking only when it is not known.
+
+    Most people know the model name and not the dimension, and the
+    dimension is what has to be right — so it is looked up, and asked
+    for only when the lookup cannot answer.
+    """
+    name = (model or "").strip()
+    bare = name.split(":")[0]
+    for candidate in (name, bare, bare.lower(), name.lower()):
+        if candidate in MODEL_DIMENSIONS:
+            return str(MODEL_DIMENSIONS[candidate])
+    known = existing.get("EMBED_DIM")
+    if known:
+        return known
+    import typer
+
+    return str(typer.prompt("Dimensions", default="1024"))
+
+
+def _ask_interactive(
+    env: Environment,
+    existing: Dict[str, str],
+    set_value,
+    console,
+) -> None:
+    """Six questions, most of them a single keypress.
+
+    The order follows the dependencies: the store decides whether a
+    host and a port are needed at all, and the embedding provider
+    decides whether a key is needed at all. Nothing is asked that has a
+    good default, and nothing is asked twice.
+    """
+    import typer
+
+    def ask_number(header: str, options: List[Tuple[str, str]], default: str = "1") -> str:
+        console.print()
+        console.print(f"[bold]{header}[/]")
+        for index, (label, note) in enumerate(options, start=1):
+            console.print(f"  [dim]{index}.[/] {label:<16} [dim]{note}[/]")
+        return typer.prompt("›", default=default).strip()
+
+    # -- the vector store ------------------------------------------------
+    choice = ask_number(
+        "Vector store",
+        [
+            ("sqlite", "a local file — nothing to install"),
+            ("qdrant", "a running Qdrant server"),
+            ("pgvector", "Postgres with the pgvector extension"),
+        ],
+    )
+    store = {"1": "sqlite", "2": "qdrant", "3": "pgvector"}.get(choice, "sqlite")
+    set_value("VECTOR_DB", store, "chosen")
+    if store == "qdrant":
+        set_value(
+            "QDRANT_HOST",
+            typer.prompt("Host", default=existing.get("QDRANT_HOST", "localhost")),
+            "chosen",
+        )
+        set_value(
+            "QDRANT_PORT",
+            str(typer.prompt("Port", default=existing.get("QDRANT_PORT", "6333"))),
+            "chosen",
+        )
+    elif store == "pgvector":
+        set_value(
+            "PG_CONN",
+            typer.prompt("Postgres DSN", default=existing.get("PG_CONN", "")),
+            "chosen",
+        )
+    else:
+        set_value(
+            "LOCAL_DB_PATH",
+            existing.get("LOCAL_DB_PATH", "atrium_local.db"),
+            "default",
+        )
+
+    # -- the embedding provider ------------------------------------------
+    choice = ask_number(
+        "Embeddings",
+        [
+            ("local server", "Ollama, LM Studio, vLLM, TEI"),
+            ("OpenAI", "api.openai.com"),
+            ("another server", "any OpenAI-compatible /v1"),
+            ("in-process", "fastembed — no server at all"),
+        ],
+    )
+    if choice == "4":
+        set_value("EMBED_PROVIDER", "fastembed", "chosen")
+        set_value("EMBED_MODEL", "BAAI/bge-small-en-v1.5", "chosen")
+        set_value("EMBED_DIM", "384", "chosen")
+    elif choice == "2":
+        set_value("EMBED_PROVIDER", "http", "chosen")
+        set_value("EMBED_BASE_URL", OPENAI_BASE_URL, "chosen")
+        model = typer.prompt("Model", default=existing.get("EMBED_MODEL", "text-embedding-3-small"))
+        set_value("EMBED_MODEL", model, "chosen")
+        set_value("EMBED_DIM", _dimension_for(model, existing), "chosen")
+        set_value(
+            "EMBED_API_KEY",
+            typer.prompt("API key", default=existing.get("EMBED_API_KEY", ""), hide_input=True),
+            "chosen",
+        )
+    else:
+        set_value("EMBED_PROVIDER", "http", "chosen")
+        if choice == "3":
+            default_url = existing.get("EMBED_BASE_URL", "http://localhost:11434/v1")
+        else:
+            detected = env.endpoints[0].base_url if env.endpoints else "http://localhost:11434/v1"
+            default_url = existing.get("EMBED_BASE_URL", detected)
+        base_url = typer.prompt("Base URL", default=default_url)
+        set_value("EMBED_BASE_URL", base_url, "chosen")
+        model = typer.prompt("Model name", default=existing.get("EMBED_MODEL", "bge-large"))
+        set_value("EMBED_MODEL", model, "chosen")
+        set_value("EMBED_DIM", _dimension_for(model, existing), "chosen")
+        # A key is only asked for when the server is not on this machine.
+        if not _is_local_url(base_url):
+            set_value(
+                "EMBED_API_KEY",
+                typer.prompt(
+                    "API key", default=existing.get("EMBED_API_KEY", ""), hide_input=True
+                ),
+                "chosen",
+            )
+
+    # -- the two switches -------------------------------------------------
+    console.print()
+    if typer.confirm("Enable OCR for scanned pages?", default=False):
+        set_value("OCR_ENABLED", "1", "chosen")
+        set_value(
+            "OCR_PROVIDER",
+            typer.prompt("OCR provider", default=existing.get("OCR_PROVIDER", "rapidocr")),
+            "chosen",
+        )
+    else:
+        set_value("OCR_ENABLED", "0", "chosen")
+
+    if typer.confirm("Enable cross-encoder reranking?", default=False):
+        set_value("RERANK_ENABLED", "1", "chosen")
+    else:
+        set_value("RERANK_ENABLED", "0", "chosen")
+
+
+def _is_local_url(url: str) -> bool:
+    """Is this URL pointing at this machine?"""
+    lowered = (url or "").lower()
+    return any(host in lowered for host in ("localhost", "127.0.0.1", "0.0.0.0", "host.docker.internal"))
+
+
 def run_wizard(
     target: Path,
     *,
@@ -405,9 +576,6 @@ def run_wizard(
     err_console=None,
 ) -> int:
     """Run the wizard. Returns a process exit code."""
-    import typer
-    from rich.markup import escape
-    from rich.panel import Panel
     from rich.table import Table
 
     console = console or _console()
@@ -423,120 +591,21 @@ def run_wizard(
         values[key] = value
         sources[key] = source
 
-    # -- 1. detect --------------------------------------------------------
+    # -- 1. what is on this machine ---------------------------------------
+    # Detection is used to fill in the defaults and to offer the setup
+    # actions below. It is not shown: the operator came here to answer
+    # a few questions, not to read a report about their own laptop.
     env = detect_environment()
 
-    if not non_interactive:
-        console.print(
-            Panel(
-                f"atrium v{_version()}\n"
-                "This checks your machine, sets up what it can, and writes a "
-                "configuration you can edit before it is saved.\n"
-                f"[dim]Writing to {target}[/]",
-                title="[accent]atrium init[/]",
-                border_style="cyan",
-            )
-        )
-
-    detected = _detected_lines(env)
-    if detected:
-        console.print("[dim]On this machine:[/]")
-        for line in detected:
-            console.print(f"  {line}")
-        console.print()
-
-    # -- 2. the vector store ---------------------------------------------
-    if non_interactive:
-        store_choice = existing.get("VECTOR_DB", "sqlite")
-    else:
-        table = Table(title=None, show_header=True, header_style="dim")
-        table.add_column("#")
-        table.add_column("store")
-        table.add_column("what it needs")
-        table.add_row("1", "sqlite (local file)", "nothing — a file next to your project")
-        table.add_row(
-            "2",
-            "qdrant",
-            "a running Qdrant" + ("" if env.qdrant_reachable else " (not running now)"),
-        )
-        table.add_row("3", "pgvector", "a Postgres with the pgvector extension")
-        console.print(table)
-        raw = typer.prompt("Which vector store?", default="1")
-        store_choice = {"1": "sqlite", "2": "qdrant", "3": "pgvector"}.get(raw.strip(), "sqlite")
-        if store_choice == "pgvector":
-            raw_conn = typer.prompt(
-                "Postgres DSN",
-                default=existing.get("PG_CONN", "postgresql://user:pass@localhost:5432/db"),
-            )
-            set_value("PG_CONN", raw_conn)
-    set_value("VECTOR_DB", store_choice, "chosen")
-    if store_choice in ("sqlite", "local", "file"):
-        set_value("LOCAL_DB_PATH", existing.get("LOCAL_DB_PATH", "atrium_local.db"), "default")
-
-    # -- 3. the embedding provider ---------------------------------------
-    choices = _embedding_choices(env)
     if non_interactive:
         _choose_non_interactive(env, existing, set_value)
     else:
-        table = Table(title=None, show_header=True, header_style="dim")
-        table.add_column("#")
-        table.add_column("embedding provider")
-        table.add_column("what it needs")
-        for index, (label, needs, _kind, _endpoint) in enumerate(choices, start=1):
-            table.add_row(str(index), escape(label), escape(needs))
-        console.print(table)
-        raw = typer.prompt("Which embedding provider?", default="1")
-        label, needs, kind, endpoint = choices[_safe_index(raw, len(choices)) - 1]
-        if kind == "fastembed":
-            set_value("EMBED_PROVIDER", "fastembed", "chosen")
-            set_value("EMBED_MODEL", "BAAI/bge-small-en-v1.5", "chosen")
-            set_value("EMBED_DIM", "384", "chosen")
-        elif kind == "openai":
-            set_value("EMBED_PROVIDER", "http", "chosen")
-            set_value("EMBED_BASE_URL", OPENAI_BASE_URL, "chosen")
-            set_value("EMBED_MODEL", "text-embedding-3-small", "chosen")
-            set_value("EMBED_DIM", "1536", "chosen")
-            raw_key = typer.prompt(
-                "OpenAI API key", default=existing.get("EMBED_API_KEY", ""), hide_input=True
-            )
-            if raw_key:
-                set_value("EMBED_API_KEY", raw_key)
-        elif kind == "custom":
-            set_value("EMBED_PROVIDER", "http", "chosen")
-            set_value(
-                "EMBED_BASE_URL",
-                typer.prompt("Base URL (including /v1)", default=existing.get("EMBED_BASE_URL", "")),
-                "chosen",
-            )
-            set_value(
-                "EMBED_MODEL",
-                typer.prompt("Model name", default=existing.get("EMBED_MODEL", "bge-large")),
-                "chosen",
-            )
-            set_value(
-                "EMBED_DIM",
-                typer.prompt("Dimensions", default=existing.get("EMBED_DIM", "1024")),
-                "chosen",
-            )
-            raw_key = typer.prompt(
-                "API key (blank for local servers)",
-                default=existing.get("EMBED_API_KEY", ""),
-                hide_input=True,
-            )
-            if raw_key:
-                set_value("EMBED_API_KEY", raw_key)
-        else:
-            set_value("EMBED_PROVIDER", "http", "chosen")
-            set_value(
-                "EMBED_BASE_URL",
-                endpoint.base_url if endpoint else "http://localhost:11434/v1",
-                "detected",
-            )
-            model = existing.get("EMBED_MODEL", "bge-large")
-            if endpoint is not None and endpoint.models and model not in endpoint.models:
-                model = endpoint.models[0]
-            set_value("EMBED_MODEL", model, "detected")
-            set_value("EMBED_DIM", existing.get("EMBED_DIM", "1024"), "default")
+        console.print()
+        console.print(
+            f"[bold]atrium {_version()}[/] [dim]— answering six questions, "
+            f"then writing {target}[/]"
+        )
+        _ask_interactive(env, existing, set_value, console)
 
     # -- 4. actions -------------------------------------------------------
     if not non_interactive:
@@ -611,6 +680,15 @@ def _choose_non_interactive(
     env: Environment, existing: Dict[str, str], set_value
 ) -> None:
     """Pick the best configuration the machine already offers."""
+    # The store: the local one needs nothing, so it is the default; a
+    # reachable Qdrant is worth using when it is already there.
+    if env.qdrant_reachable:
+        set_value("VECTOR_DB", "qdrant", "detected")
+        set_value("QDRANT_HOST", "localhost", "detected")
+        set_value("QDRANT_PORT", "6333", "detected")
+    else:
+        set_value("VECTOR_DB", "sqlite", "detected")
+        set_value("LOCAL_DB_PATH", "atrium_local.db", "detected")
     if env.fastembed_installed:
         set_value("EMBED_PROVIDER", "fastembed", "detected")
         set_value("EMBED_MODEL", "BAAI/bge-small-en-v1.5", "detected")
@@ -716,12 +794,15 @@ def _offer_actions(
             return False
 
     model = values.get("EMBED_MODEL", "")
+    # Ollama reports "bge-large:latest"; the model is asked for as
+    # "bge-large". Compare them as the same model.
+    installed = {name.split(":")[0] for name in env.ollama_models}
     needs_pull = (
         values.get("EMBED_PROVIDER", "http") == "http"
         and model
         and env.ollama_installed
         and env.ollama_running
-        and model not in env.ollama_models
+        and model.split(":")[0] not in installed
     )
     if needs_pull:
         offer(
