@@ -84,6 +84,14 @@ def _err_console() -> Console:
     return Console(theme=_THEME, stderr=True)
 
 
+
+def _brand(subtitle: str = "") -> None:
+    """The Atrium header, on the commands that print something."""
+    from atrium.setup import brand
+
+    brand(console, subtitle)
+
+
 def _quiet_logs(verbose: bool = False) -> None:
     """Keep CLI output readable.
 
@@ -813,7 +821,7 @@ def doctor(
     table.add_row("model", effective.get("EMBED_MODEL", "?"))
     api_key_state = "set" if effective.get("API_KEY") else "[warn]not set[/]"
     table.add_row("api key", api_key_state)
-    console.print(Panel(table, title="[accent]atrium doctor[/]", border_style="cyan"))
+    console.print(Panel(table, title="[bold accent]atrium doctor[/]", border_style="accent"))
 
     if problems:
         _err_console().print("[bad]Configuration problems:[/]")
@@ -1048,6 +1056,7 @@ def ingest(
     ),
 ) -> None:
     """Parse, chunk, embed and store documents in the vector store."""
+    _brand("ingest")
     from atrium.pipeline import ingest_document
 
     _quiet_logs(verbose)
@@ -1136,6 +1145,7 @@ def search(
     ),
 ) -> None:
     """Query the ingested corpus."""
+    _brand("search")
     import json
 
     _quiet_logs(verbose)
@@ -1289,11 +1299,7 @@ def demo(
         raw = _DEMO_DOCUMENT.encode("utf-8")
         filename = "atrium-demo.md"
 
-    console.print(Panel(
-        "[dim]Ingesting one document, then searching the corpus back.[/]",
-        title="[accent]atrium demo[/]",
-        border_style="cyan",
-    ))
+    _brand("demo — ingesting one document, then searching it back")
 
     parser, embedder, db = _build_runtime()
     try:
@@ -1354,6 +1360,7 @@ def serve(
     reload: bool = typer.Option(False, "--reload", help="Enable auto-reload (dev only)"),
 ) -> None:
     """Run the FastAPI server with uvicorn. Reads .env from the cwd."""
+    _brand(f"serving on {host}:{port}")
     import uvicorn
 
     from atrium.config import env_str

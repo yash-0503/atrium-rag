@@ -32,6 +32,7 @@ from pathlib import Path
 from typing import Dict, List, Optional, Sequence, Tuple
 
 __all__ = [
+    "brand",
     "Environment",
     "Endpoint",
     "Check",
@@ -56,6 +57,40 @@ OPENAI_BASE_URL = "https://api.openai.com/v1"
 # The dimensions of the models people actually use. Knowing the
 # dimension saves a question; the verification step catches the ones
 # that are not in here.
+# The options for the switches. Everything the operator can choose is
+# a choice, not a thing to type: a name they have to remember is a
+# question they can get wrong.
+OCR_PROVIDERS = [
+    ("rapidocr", "pip-only — no binary to install"),
+    ("tesseract", "the Tesseract binary, if it is on PATH"),
+]
+
+OCR_LANGUAGES = [
+    ("eng", "English"),
+    ("ara", "Arabic"),
+    ("chi_sim", "Chinese (simplified)"),
+    ("jpn", "Japanese"),
+    ("kor", "Korean"),
+    ("deu", "German"),
+    ("fra", "French"),
+    ("spa", "Spanish"),
+    ("rus", "Russian"),
+]
+
+RERANK_PROVIDERS = [
+    ("bge", "BAAI cross-encoder, runs locally"),
+    ("flashrank", "~30MB ONNX, no PyTorch"),
+    ("cohere", "hosted API, needs a key"),
+]
+
+RERANK_MODELS = {
+    "bge": ["BAAI/bge-reranker-large", "BAAI/bge-reranker-base", "BAAI/bge-reranker-v2-m3"],
+    "flashrank": ["ms-marco-MiniLM-L-12-v2", "ms-marco-MiniLM-L-6-v2"],
+    "cohere": ["rerank-english-v3.0", "rerank-multilingual-v3.0"],
+}
+
+VISION_MODELS = ["minicpm-v4.6:1b", "llama3.2-vision:11b", "qwen2.5vl:7b"]
+
 MODEL_DIMENSIONS = {
     "bge-large": 1024,
     "bge-large-en-v1.5": 1024,
@@ -127,6 +162,32 @@ class Environment:
             if endpoint.has(model):
                 return endpoint
         return None
+
+
+
+def brand(console, subtitle: str = "") -> None:
+    """The Atrium header.
+
+    A CLI that prints tables with no name on them looks like output
+    from somewhere else. This is the one line that says which tool it
+    is, and it is the first thing on the screen.
+    """
+    from rich.panel import Panel
+
+    from atrium import __version__
+
+    body = f"[accent]{__version__}[/]"
+    if subtitle:
+        body += f" [dim]·[/] {subtitle}"
+    console.print(
+        Panel(
+            body,
+            title="[bold accent]atrium[/]",
+            title_align="left",
+            border_style="accent",
+            padding=(0, 1),
+        )
+    )
 
 
 def _which(binary: str) -> bool:
@@ -397,22 +458,29 @@ def _write_env_file(
     path.write_text("\n".join(lines) + "\n", encoding="utf-8")
 
 
-def _review_table(values: Dict[str, str], sources: Dict[str, str]) -> str:
-    rows = []
-    for key, value in values.items():
-        shown = value if value else "(unset)"
-        if key in SECRET_KEYS and value:
-            shown = "set (hidden)"
-        rows.append(f"{key:<20} {shown:<42} {sources.get(key, 'default')}")
-    body = "\n".join(rows)
-    return (
-        f"{body}\n\n"
-        "set KEY VALUE   change a value\n"
-        "unset KEY       remove a key\n"
-        "edit            open this file in $EDITOR\n"
-        "save            write it and continue"
-    )
 
+# Names that suggest a model embeds text. A server usually serves
+# chat and vision models too, and offering those as embedding models
+# is a trap: the request fails at the first embed, minutes later.
+_EMBEDDING_HINTS = (
+    "embed", "bge", "e5", "gte", "minilm", "mxbai", "paraphrase",
+    "snowflake", "labse", "jina", "voyage",
+)
+
+
+def _looks_like_embedder(name: str) -> bool:
+    lowered = (name or "").lower()
+    return any(hint in lowered for hint in _EMBEDDING_HINTS)
+
+
+
+def _is_local_url(url: str) -> bool:
+    """Is this URL pointing at this machine?"""
+    lowered = (url or "").lower()
+    return any(
+        host in lowered
+        for host in ("localhost", "127.0.0.1", "0.0.0.0", "host.docker.internal")
+    )
 
 
 def _dimension_for(model: str, existing: Dict[str, str]) -> str:
@@ -435,6 +503,89 @@ def _dimension_for(model: str, existing: Dict[str, str]) -> str:
     return str(typer.prompt("Dimensions", default="1024"))
 
 
+def _menu(
+    console,
+    title: str,
+    options: List[Tuple[str, str]],
+    allow_other: bool = False,
+    default: str = "1",
+) -> str:
+    """A numbered menu. Returns the chosen key.
+
+    Every choice the operator can make is a choice they pick from a
+    list, because a name they have to remember is a name they can get
+    wrong. `allow_other` adds a last option for typing something the
+    list does not have.
+    """
+    import typer
+
+    console.print()
+    console.print(f"[bold]{title}[/]")
+    for index, (key, note) in enumerate(options, start=1):
+        console.print(f"  [dim]{index}.[/] {key:<34} [dim]{note}[/]")
+    if allow_other:
+        console.print(
+            f"  [dim]{len(options) + 1}.[/] {'type another name':<34} "
+            "[dim]anything else[/]"
+        )
+    choice = typer.prompt("\u203a", default=default).strip()
+    if allow_other and choice == str(len(options) + 1):
+        return typer.prompt("name", default="").strip()
+    index = _safe_index(choice, len(options) + (1 if allow_other else 0)) - 1
+    if index < 0 or index >= len(options):
+        return options[0][0]
+    return options[index][0]
+
+
+def _summary_line(values: Dict[str, str]) -> List[Tuple[str, str]]:
+    """The handful of settings worth showing at a glance.
+
+    Forty-five keys is a configuration dump. These five are the shape
+    of the installation, and the rest is detail.
+    """
+    store = values.get("VECTOR_DB", "sqlite")
+    store_note = {
+        "sqlite": f"a local file ({values.get('LOCAL_DB_PATH', 'atrium_local.db')})",
+        "qdrant": f"{values.get('QDRANT_HOST', 'localhost')}:{values.get('QDRANT_PORT', '6333')}",
+        "pgvector": "postgres",
+    }.get(store, store)
+
+    provider = values.get("EMBED_PROVIDER", "http")
+    if provider == "fastembed":
+        embeddings = (
+            f"{values.get('EMBED_MODEL', '?')} \u00b7 {values.get('EMBED_DIM', '?')}-d "
+            "\u00b7 in-process"
+        )
+    else:
+        embeddings = (
+            f"{values.get('EMBED_BASE_URL', '?')} \u00b7 "
+            f"{values.get('EMBED_MODEL', '?')} \u00b7 {values.get('EMBED_DIM', '?')}-d"
+        )
+
+    def _on(key: str) -> bool:
+        return str(values.get(key, "0")).lower() in ("1", "true", "yes", "on")
+
+    ocr = (
+        "off"
+        if not _on("OCR_ENABLED")
+        else f"{values.get('OCR_PROVIDER', 'tesseract')} \u00b7 {values.get('OCR_LANG', 'eng')}"
+    )
+    rerank = (
+        "off"
+        if not _on("RERANK_ENABLED")
+        else f"{values.get('RERANK_PROVIDER', 'bge')} \u00b7 "
+             f"{values.get('RERANK_MODEL', '') or 'default'}"
+    )
+    vision = "off" if not _on("VISION_ENABLED") else values.get("VISION_MODEL", "minicpm-v4.6:1b")
+    return [
+        ("store", store_note),
+        ("embeddings", embeddings),
+        ("ocr", ocr),
+        ("rerank", rerank),
+        ("vision", vision),
+    ]
+
+
 def _ask_interactive(
     env: Environment,
     existing: Dict[str, str],
@@ -446,27 +597,21 @@ def _ask_interactive(
     The order follows the dependencies: the store decides whether a
     host and a port are needed at all, and the embedding provider
     decides whether a key is needed at all. Nothing is asked that has a
-    good default, and nothing is asked twice.
+    good default, nothing is asked twice, and every choice that has a
+    list of possible answers is a list the operator picks from.
     """
     import typer
 
-    def ask_number(header: str, options: List[Tuple[str, str]], default: str = "1") -> str:
-        console.print()
-        console.print(f"[bold]{header}[/]")
-        for index, (label, note) in enumerate(options, start=1):
-            console.print(f"  [dim]{index}.[/] {label:<16} [dim]{note}[/]")
-        return typer.prompt("›", default=default).strip()
-
     # -- the vector store ------------------------------------------------
-    choice = ask_number(
+    store = _menu(
+        console,
         "Vector store",
         [
-            ("sqlite", "a local file — nothing to install"),
+            ("sqlite", "a local file \u2014 nothing to install"),
             ("qdrant", "a running Qdrant server"),
             ("pgvector", "Postgres with the pgvector extension"),
         ],
     )
-    store = {"1": "sqlite", "2": "qdrant", "3": "pgvector"}.get(choice, "sqlite")
     set_value("VECTOR_DB", store, "chosen")
     if store == "qdrant":
         set_value(
@@ -493,44 +638,79 @@ def _ask_interactive(
         )
 
     # -- the embedding provider ------------------------------------------
-    choice = ask_number(
+    provider = _menu(
+        console,
         "Embeddings",
         [
             ("local server", "Ollama, LM Studio, vLLM, TEI"),
             ("OpenAI", "api.openai.com"),
             ("another server", "any OpenAI-compatible /v1"),
-            ("in-process", "fastembed — no server at all"),
+            ("in-process", "fastembed \u2014 no server at all"),
         ],
     )
-    if choice == "4":
+
+    if provider == "in-process":
         set_value("EMBED_PROVIDER", "fastembed", "chosen")
         set_value("EMBED_MODEL", "BAAI/bge-small-en-v1.5", "chosen")
         set_value("EMBED_DIM", "384", "chosen")
-    elif choice == "2":
-        set_value("EMBED_PROVIDER", "http", "chosen")
-        set_value("EMBED_BASE_URL", OPENAI_BASE_URL, "chosen")
-        model = typer.prompt("Model", default=existing.get("EMBED_MODEL", "text-embedding-3-small"))
-        set_value("EMBED_MODEL", model, "chosen")
-        set_value("EMBED_DIM", _dimension_for(model, existing), "chosen")
-        set_value(
-            "EMBED_API_KEY",
-            typer.prompt("API key", default=existing.get("EMBED_API_KEY", ""), hide_input=True),
-            "chosen",
-        )
     else:
         set_value("EMBED_PROVIDER", "http", "chosen")
-        if choice == "3":
-            default_url = existing.get("EMBED_BASE_URL", "http://localhost:11434/v1")
+        if provider == "OpenAI":
+            base_url = OPENAI_BASE_URL
+            needs_key = True
+        elif provider == "another server":
+            base_url = typer.prompt(
+                "Base URL",
+                default=existing.get("EMBED_BASE_URL", "http://localhost:11434/v1"),
+            )
+            needs_key = not _is_local_url(base_url)
         else:
-            detected = env.endpoints[0].base_url if env.endpoints else "http://localhost:11434/v1"
-            default_url = existing.get("EMBED_BASE_URL", detected)
-        base_url = typer.prompt("Base URL", default=default_url)
+            detected = (
+                env.endpoints[0].base_url if env.endpoints else "http://localhost:11434/v1"
+            )
+            base_url = typer.prompt(
+                "Base URL", default=existing.get("EMBED_BASE_URL", detected)
+            )
+            needs_key = not _is_local_url(base_url)
         set_value("EMBED_BASE_URL", base_url, "chosen")
-        model = typer.prompt("Model name", default=existing.get("EMBED_MODEL", "bge-large"))
+
+        # The models the endpoint actually offers, so the model is
+        # picked rather than typed.
+        models: List[str] = []
+        probed = _probe_endpoint(base_url)
+        if probed is not None:
+            models = list(probed.models)
+        others: List[str] = []
+        if models:
+            options = []
+            for name in models:
+                dim = MODEL_DIMENSIONS.get(name) or MODEL_DIMENSIONS.get(name.split(":")[0])
+                if _looks_like_embedder(name) or dim:
+                    options.append((name, f"{dim}-d" if dim else ""))
+                else:
+                    others.append(name)
+            if not options:
+                options = [(name, "") for name in models[:6]]
+                others = []
+        else:
+            options = [
+                (name, f"{dim}-d")
+                for name, dim in (
+                    ("bge-large", 1024),
+                    ("nomic-embed-text:v1.5", 768),
+                    ("text-embedding-3-small", 1536),
+                )
+            ]
+        model = _menu(console, "Model", options, allow_other=True)
+        if others:
+            console.print(
+                "  [dim]also on this server, but not embedding models: "
+                + ", ".join(others[:6]) + "[/]"
+            )
         set_value("EMBED_MODEL", model, "chosen")
         set_value("EMBED_DIM", _dimension_for(model, existing), "chosen")
-        # A key is only asked for when the server is not on this machine.
-        if not _is_local_url(base_url):
+
+        if needs_key:
             set_value(
                 "EMBED_API_KEY",
                 typer.prompt(
@@ -539,29 +719,92 @@ def _ask_interactive(
                 "chosen",
             )
 
-    # -- the two switches -------------------------------------------------
-    console.print()
+    # -- OCR ---------------------------------------------------------------
     if typer.confirm("Enable OCR for scanned pages?", default=False):
         set_value("OCR_ENABLED", "1", "chosen")
-        set_value(
-            "OCR_PROVIDER",
-            typer.prompt("OCR provider", default=existing.get("OCR_PROVIDER", "rapidocr")),
-            "chosen",
-        )
+        ocr_provider = _menu(console, "OCR provider", OCR_PROVIDERS)
+        set_value("OCR_PROVIDER", ocr_provider, "chosen")
+        language = _menu(console, "OCR language", OCR_LANGUAGES, allow_other=True)
+        set_value("OCR_LANG", language, "chosen")
     else:
         set_value("OCR_ENABLED", "0", "chosen")
 
+    # -- reranking ---------------------------------------------------------
     if typer.confirm("Enable cross-encoder reranking?", default=False):
         set_value("RERANK_ENABLED", "1", "chosen")
+        rerank_provider = _menu(console, "Rerank provider", RERANK_PROVIDERS)
+        set_value("RERANK_PROVIDER", rerank_provider, "chosen")
+        model = _menu(
+            console,
+            "Rerank model",
+            [(name, "") for name in RERANK_MODELS.get(rerank_provider, [])],
+            allow_other=True,
+        )
+        set_value("RERANK_MODEL", model, "chosen")
+        if rerank_provider == "cohere":
+            set_value(
+                "COHERE_API_KEY",
+                typer.prompt(
+                    "Cohere API key",
+                    default=existing.get("COHERE_API_KEY", ""),
+                    hide_input=True,
+                ),
+                "chosen",
+            )
     else:
         set_value("RERANK_ENABLED", "0", "chosen")
 
+    # -- vision ------------------------------------------------------------
+    if typer.confirm("Enable vision models for images?", default=False):
+        set_value("VISION_ENABLED", "1", "chosen")
+        model = _menu(
+            console,
+            "Vision model",
+            [(name, "") for name in VISION_MODELS],
+            allow_other=True,
+        )
+        set_value("VISION_MODEL", model, "chosen")
+    else:
+        set_value("VISION_ENABLED", "0", "chosen")
 
-def _is_local_url(url: str) -> bool:
-    """Is this URL pointing at this machine?"""
-    lowered = (url or "").lower()
-    return any(host in lowered for host in ("localhost", "127.0.0.1", "0.0.0.0", "host.docker.internal"))
 
+def _review_table(values: Dict[str, str], sources: Dict[str, str]) -> str:
+    """What the installation will look like, in two blocks.
+
+    The first block is the shape of the thing — store, embeddings,
+    OCR, rerank, vision. The second is the keys this run actually set.
+    The forty other keys in the file are listed as a count, because a
+    list of forty-five is not information anyone can act on.
+    """
+    interesting = {
+        key: value
+        for key, value in values.items()
+        if sources.get(key, "existing") != "existing"
+    }
+    lines = []
+    for label, note in _summary_line(values):
+        lines.append(f"  {label:<12} {note}")
+
+    if interesting:
+        lines.append("")
+        width = max(len(key) for key in interesting) + 2
+        for key, value in interesting.items():
+            shown = value if value else "(unset)"
+            if key in SECRET_KEYS and value:
+                shown = "set (hidden)"
+            lines.append(f"  {key:<{width}} {shown}")
+
+    others = len(values) - len(interesting)
+    if others:
+        lines.append("")
+        lines.append(f"  [+ {others} other setting(s) already in .env, unchanged]")
+
+    lines.append("")
+    lines.append("  set KEY VALUE   change a value")
+    lines.append("  unset KEY       remove a key")
+    lines.append("  edit            open this file in $EDITOR")
+    lines.append("  save            write it and continue")
+    return "\n".join(lines)
 
 def run_wizard(
     target: Path,
@@ -601,10 +844,7 @@ def run_wizard(
         _choose_non_interactive(env, existing, set_value)
     else:
         console.print()
-        console.print(
-            f"[bold]atrium {_version()}[/] [dim]— answering six questions, "
-            f"then writing {target}[/]"
-        )
+        brand(console, f"setting up {target}")
         _ask_interactive(env, existing, set_value, console)
 
     # -- 4. actions -------------------------------------------------------
@@ -705,66 +945,12 @@ def _choose_non_interactive(
     set_value("EMBED_DIM", existing.get("EMBED_DIM", "1024"), "detected")
 
 
-def _embedding_choices(env: Environment) -> List[Tuple[str, str, str, Optional[Endpoint]]]:
-    """The embedding providers, as (label, needs, kind, endpoint) tuples."""
-    choices: List[Tuple[str, str, str, Optional[Endpoint]]] = []
-    for endpoint in env.endpoints:
-        models = ", ".join(endpoint.models[:3]) if endpoint.models else "no models listed"
-        choices.append((endpoint.label, f"reachable — {models}", "http", endpoint))
-    choices.append(("local server (default URL)", "http://localhost:11434/v1", "http", None))
-    choices.append(
-        (
-            "in-process (fastembed)",
-            'nothing running — `pip install "atrium-rag[local]"`'
-            if not env.fastembed_installed
-            else "installed",
-            "fastembed",
-            None,
-        )
-    )
-    choices.append(("OpenAI", "an API key", "openai", None))
-    choices.append(("another OpenAI-compatible server", "a base URL and a model", "custom", None))
-    return choices
-
-
 def _safe_index(raw: str, count: int) -> int:
     try:
         index = int(str(raw).strip())
     except (TypeError, ValueError):
         return 1
     return max(1, min(index, count))
-
-
-def _detected_lines(env: Environment) -> List[str]:
-    lines = []
-    if env.ollama_running:
-        models = ", ".join(env.ollama_models[:4]) if env.ollama_models else "no models"
-        lines.append(f"[ok]embedding server[/] running — {models}")
-    elif env.ollama_installed:
-        lines.append("[warn]embedding server[/] installed but not running")
-    else:
-        lines.append("[dim]embedding server[/] not installed")
-    if env.qdrant_reachable:
-        lines.append("[ok]qdrant[/] reachable")
-    elif env.docker_installed:
-        lines.append(
-            "[warn]docker[/] installed"
-            + ("" if env.docker_running else " but not running")
-            + " — qdrant not reachable"
-        )
-    else:
-        lines.append("[dim]docker[/] not installed")
-    lines.append(
-        "[ok]tesseract[/] installed"
-        if env.tesseract_installed
-        else "[dim]tesseract[/] not installed (OCR is off by default)"
-    )
-    lines.append(
-        "[ok]fastembed[/] installed"
-        if env.fastembed_installed
-        else "[dim]fastembed[/] not installed (the `local` extra)"
-    )
-    return lines
 
 
 def _offer_actions(
