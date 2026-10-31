@@ -285,6 +285,11 @@ docker compose --profile qdrant up -d
 The image runs as a non-root user and carries a health check. Build
 with extras via `--build-arg EXTRAS="ocr,rerank"`.
 
+The Compose stack needs an embedding endpoint on the host — it points
+`EMBED_BASE_URL` at `host.docker.internal:11434`, which is where Ollama
+listens by default. Run `ollama serve` and `ollama pull bge-large`
+first, or point `.env.docker` at whatever endpoint you use.
+
 ---
 
 ## Supported formats
