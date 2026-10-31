@@ -316,6 +316,18 @@ class Check:
     fix: str = ""
 
 
+
+def kind_label(kind: str) -> str:
+    """What a store is called in a sentence."""
+    return {
+        "qdrant": "qdrant",
+        "pgvector": "postgres",
+        "sqlite": "local file",
+        "local": "local file",
+        "file": "local file",
+    }.get(kind, kind)
+
+
 def verify(values: Dict[str, str]) -> List[Check]:
     """Check the configuration the way a user would experience it.
 
@@ -385,20 +397,35 @@ def verify(values: Dict[str, str]) -> List[Check]:
                     )
                 )
 
+    store_kind = (values.get("VECTOR_DB") or "sqlite").lower()
+    store_fix = "Start it, or set VECTOR_DB=sqlite for the local store"
     try:
         store = store_from_values(values)
-        kind = (values.get("VECTOR_DB") or "sqlite").lower()
-        if kind in ("sqlite", "local", "file"):
-            store.ensure_collection("documents", int(values.get("EMBED_DIM") or 1024))
-            checks.append(Check("vector store", True, f"local file {store.path}"))
+        if store_kind in ("sqlite", "local", "file"):
+            try:
+                store.ensure_collection("documents", int(values.get("EMBED_DIM") or 1024))
+                checks.append(Check("vector store", True, f"local file {store.path}"))
+            except ValueError as exc:
+                # The store holds vectors at a different dimension than
+                # the model now produces. The vectors are useless to
+                # the new model, so the store has to start again.
+                checks.append(
+                    Check(
+                        "vector store",
+                        False,
+                        str(exc),
+                        "The local store holds vectors the new model cannot "
+                        "use. Start a new one — the old file is moved aside.",
+                    )
+                )
         else:
             healthy = store.health()
             checks.append(
                 Check(
                     "vector store",
                     healthy,
-                    kind if healthy else "not reachable",
-                    "Start it, or set VECTOR_DB=sqlite for the local store",
+                    kind_label(store_kind) if healthy else "not reachable",
+                    store_fix,
                 )
             )
     except Exception as exc:
@@ -407,7 +434,7 @@ def verify(values: Dict[str, str]) -> List[Check]:
                 "vector store",
                 False,
                 f"{type(exc).__name__}: {exc}",
-                "Start it, or set VECTOR_DB=sqlite for the local store",
+                store_fix,
             )
         )
 
@@ -1195,10 +1222,66 @@ def run_wizard(
         for check in checks:
             if not check.ok and check.fix:
                 err_console.print(f"  [key]{check.name}[/] — {check.fix}")
+        # The one failure we can put right from here: a local store
+        # whose vectors the new model cannot use.
+        if _offer_new_store(target_values, checks, console, err_console):
+            with ui.space_status(console, "Verifying…"):
+                checks = verify(target_values)
+            ok = all(check.ok for check in checks)
+            console.print()
+            ui.reveal_checks(console, checks, animate=False)
+            if ok:
+                console.print()
+                ui.launch_ready(console, "All systems ready")
+                return 0
+
         err_console.print(
             "[dim]Edit the file and run[/] [key]atrium doctor[/] [dim]to re-check.[/]"
         )
     return 0 if ok else 1
+
+
+
+def _offer_new_store(
+    values: Dict[str, str],
+    checks: List[Check],
+    console,
+    err_console,
+) -> bool:
+    """Offer to start a fresh local store when the dimension changed.
+
+    The vectors in the old store are a different length from the ones
+    the new model produces, and the store will not mix them. Moving
+    the file aside is the fix, and it keeps the old corpus around in
+    case it was wanted.
+    """
+    import sys
+
+    import typer
+
+    if not sys.stdin.isatty():
+        return False
+    if (values.get("VECTOR_DB") or "sqlite").lower() not in ("sqlite", "local", "file"):
+        return False
+    store_check = next((c for c in checks if c.name == "vector store"), None)
+    if store_check is None or store_check.ok or "dim" not in store_check.detail:
+        return False
+    path = Path(values.get("LOCAL_DB_PATH") or "atrium_local.db").expanduser()
+    if not path.exists():
+        return False
+    if not typer.confirm(
+        "Start a new local store? (the old file is moved aside)",
+        default=True,
+    ):
+        return False
+    backup = path.with_name(path.name + ".bak")
+    try:
+        path.rename(backup)
+    except OSError as exc:
+        err_console.print(f"[bad]Could not move {path}: {exc}[/]")
+        return False
+    console.print(f"[ok]Moved[/] {path.name} → {backup.name}")
+    return True
 
 
 def _console():

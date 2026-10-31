@@ -71,7 +71,7 @@ def _rgb(h: str) -> Tuple[int, int, int]:
 def _mix(a: str, b: str, t: float) -> str:
     t = min(max(t, 0.0), 1.0)
     ra, rb = _rgb(a), _rgb(b)
-    return "#%02X%02X%02X" % tuple(round(ra[i] + (rb[i] - ra[i]) * t) for i in range(3))
+    return "#{:02X}{:02X}{:02X}".format(*tuple(round(ra[i] + (rb[i] - ra[i]) * t) for i in range(3)))
 
 
 def _blend(stops: Sequence[str], t: float) -> str:

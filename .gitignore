@@ -78,6 +78,9 @@ logs/
 *.sqlite-journal
 *.db
 *.db-journal
+*.db-wal
+*.db-shm
+*.db.bak
 !*.example.db
 
 # Local Qdrant data (in case user runs it as a process, not container)

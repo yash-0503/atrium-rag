@@ -64,20 +64,9 @@ app = typer.Typer(
 from rich.console import Console
 from rich.panel import Panel
 from rich.table import Table
-from rich.theme import Theme
-
-_THEME = Theme(
-    {
-        "ok": "bold green",
-        "warn": "bold yellow",
-        "bad": "bold red",
-        "key": "bold cyan",
-        "dim": "dim",
-        "accent": "bold magenta",
-    }
-)
 
 from atrium.ui import THEME, space_status
+
 console = Console(theme=THEME)
 
 
@@ -562,12 +551,17 @@ def _probe_vector_db(values: Dict[str, str]) -> Tuple[bool, str]:
     """Cheap probe for the configured vector DB backend. Returns
     (ok, detail)."""
     backend = values.get("VECTOR_DB", "sqlite")
+    dim = int(values.get("EMBED_DIM", "1024") or 1024)
     try:
         if backend in ("sqlite", "local", "file"):
             from atrium.local_store import SqliteAdapter
 
             path = values.get("LOCAL_DB_PATH", "atrium_local.db")
-            SqliteAdapter(path=path).health()
+            store = SqliteAdapter(path=path)
+            # ensure_collection, not health: a store that holds
+            # vectors of a different length is not healthy, and that is
+            # exactly the state a doctor must catch.
+            store.ensure_collection("documents", dim)
             return True, f"local file {path}"
         if backend == "qdrant":
             from qdrant_client import QdrantClient
@@ -578,6 +572,7 @@ def _probe_vector_db(values: Dict[str, str]) -> Tuple[bool, str]:
             )
             client.get_collections()
             return True, f"{values.get('QDRANT_HOST', 'localhost')}:{values.get('QDRANT_PORT', '6333')}"
+
         if backend == "pgvector":
             import psycopg
 
@@ -839,10 +834,22 @@ def doctor(
             ("vector db", _probe_vector_db),
         ):
             ok, detail = probe(effective)
-            mark = "[ok]OK[/]" if ok else "[bad]unreachable[/]"
+            if ok:
+                mark = "[ok]OK[/]"
+            elif "dim" in detail:
+                # A store holding vectors of a different length is not
+                # unreachable; it is mismatched, and the fix is different.
+                mark = "[bad]dimension mismatch[/]"
+            else:
+                mark = "[bad]unreachable[/]"
             console.print(f"  {label:<10} {mark}  [dim]{detail}[/]")
             if not ok:
                 remote_ok = False
+                if "dim" in detail:
+                    console.print(
+                        "  [dim]the store holds vectors the model cannot use — "
+                        "start a new one (`atrium init`) and re-ingest[/]"
+                    )
 
     # Security posture notes — flag a permissive config before the
     # operator ships it. Warnings, not failures.
