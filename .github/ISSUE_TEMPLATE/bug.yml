@@ -1,0 +1,63 @@
+name: Bug report
+description: Something behaves differently from what the README says it does.
+labels: ["bug"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Thanks for the report. The fastest route to a fix is a document you
+        can hand over and a command that shows the wrong behaviour.
+  - type: input
+    id: version
+    attributes:
+      label: Version
+      description: The output of `atrium version`
+      placeholder: atrium 0.2.0
+    validations:
+      required: true
+  - type: dropdown
+    id: surface
+    attributes:
+      label: Where did it happen?
+      options:
+        - The API (`atrium serve`)
+        - The CLI
+        - The parser
+        - The chunker
+        - The retrieval / search
+        - `atrium init` or `atrium doctor`
+        - Something else
+    validations:
+      required: true
+  - type: textarea
+    id: repro
+    attributes:
+      label: How to reproduce it
+      description: The command or request, and what you expected instead.
+      placeholder: |
+        atrium ingest ./report.pdf
+        -> expected 120 chunks, got 0
+    validations:
+      required: true
+  - type: textarea
+    id: document
+    attributes:
+      label: The document
+      description: |
+        If the problem involves a specific document, attach it or say where
+        to find it. If it is a third-party document, a link is enough.
+      placeholder: attached
+  - type: textarea
+    id: logs
+    attributes:
+      label: Logs or output
+      description: Paste the relevant output, with any API key removed.
+      render: shell
+  - type: checkboxes
+    id: checks
+    attributes:
+      label: Before submitting
+      options:
+        - label: I searched the existing issues for this one.
+          required: true
+        - label: I removed any API key from the logs above.

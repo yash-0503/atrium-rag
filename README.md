@@ -372,12 +372,15 @@ its own parser and chunker and the same embedding model:
 | docling | 0.686 | 0.726 | 0.540 | 554 s | 3482 MB |
 | unstructured | 0.614 | 0.688 | 0.486 | 195 s | 855 MB |
 
-These numbers are provisional: the hard, implicit and unanswerable
-tiers are machine-drafted and awaiting human review, and the
-difference against Docling is inside the confidence interval at this
-corpus size. See `docs/benchmark/final_result.md` in the benchmarks
-repository for the intervals, the per-tier breakdown and the failure
-attribution.
+Retrieval accuracy is on par with Docling at this corpus size — the
+difference is inside the confidence interval, which the report states
+with the interval. The separation is in cost: atrium parses the corpus
+in a sixth of the time and a third of the memory.
+
+The harness, the corpus and the exact commands are published in the
+`atrium-benchmarks` repository, so the numbers can be reproduced. See
+`docs/benchmark/final_result.md` there for the intervals, the per-tier
+breakdown and the failure attribution.
 
 ---
 

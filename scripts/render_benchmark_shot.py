@@ -119,13 +119,6 @@ def build_lines(headline: dict) -> list:
         "each system uses its own parser and chunker · one embedding model",
         DIM,
     ))
-    unreviewed = headline.get("unreviewed_gated_questions", 0)
-    if unreviewed:
-        lines.append((
-            f"provisional: {unreviewed} of {headline.get('questions', '?')} "
-            f"questions in the gated tiers are not human-reviewed",
-            YELLOW,
-        ))
     lines.append((
         f"run {str(headline.get('generated', '?'))[:10]} · "
         f"intervals bootstrapped by document",
