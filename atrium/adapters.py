@@ -9,6 +9,7 @@ Embedding and vector-DB adapters behind small protocols. Implementations:
   pipeline code.
 """
 
+from contextlib import contextmanager
 from typing import Any, Dict, List, Optional, Protocol
 
 from tenacity import retry, stop_after_attempt, wait_exponential
@@ -262,6 +263,28 @@ class OpenAICompatibleEmbedder:
 # Vector DBs -- both implementations of VectorDBAdapter. Tenacity retries
 # on transient failures, dim mismatch checked at collection ensure.
 
+
+@contextmanager
+def _quiet_pool_logs():
+    """Silence the connection pool while a probe runs.
+
+    The pool retries in the background and logs every attempt, so a
+    health check against a database that is not there prints the same
+    connection error nine times. The operator needs to be told once.
+    """
+    import logging
+
+    loggers = [logging.getLogger("psycopg.pool"), logging.getLogger("psycopg")]
+    previous = [logger.level for logger in loggers]
+    for logger in loggers:
+        logger.setLevel(logging.CRITICAL)
+    try:
+        yield
+    finally:
+        for logger, level in zip(loggers, previous):
+            logger.setLevel(level)
+
+
 class QdrantAdapter:
     def __init__(self, host: str, port: int = 6333):
         self.client = _qdrant_client_cls()(host=host, port=port)
@@ -486,9 +509,12 @@ class PgVectorAdapter:
             conn.execute("DELETE FROM chunks WHERE doc_id = %s AND ingest_run_id != %s", (doc_id, current_run_id))
 
     def health(self) -> bool:
-        try:
-            with self.pool.connection() as conn: return conn.execute("SELECT 1;").fetchone()[0] == 1
-        except Exception: return False
+        with _quiet_pool_logs():
+            try:
+                with self.pool.connection() as conn:
+                    return conn.execute("SELECT 1;").fetchone()[0] == 1
+            except Exception:
+                return False
 
     # ------------------------------------------------------------------
     # Retrieval protocol (Task B, 2026-10-10). Same hit-dict shape as

@@ -558,6 +558,16 @@ def _menu_tty(
     index = 0
     drawn = 0
 
+    # Every line has to fit the terminal. A line that wraps occupies
+    # two rows, and "move the cursor up one line" then moves up one
+    # *row*, not one line — which is how a menu ends up walking down
+    # the screen instead of redrawing in place.
+    import shutil
+
+    width = max(40, shutil.get_terminal_size((80, 24)).columns)
+    key_width = min(30, max(12, width // 3))
+    note_width = max(8, width - key_width - 6)
+
     def render() -> None:
         nonlocal drawn
         if drawn:
@@ -566,7 +576,11 @@ def _menu_tty(
         for position, (key, note) in enumerate(choices):
             marker = "\x1b[36m\u276f\x1b[0m" if position == index else " "
             weight = "\x1b[1m" if position == index else ""
-            lines.append(f" {marker} {weight}{key:<34}\x1b[0m \x1b[2m{note}\x1b[0m")
+            shown = key[:key_width].ljust(key_width)
+            detail = note[:note_width]
+            lines.append(
+                f" {marker} {weight}{shown}\x1b[0m \x1b[2m{detail}\x1b[0m"
+            )
         lines.append(" \x1b[2m\u2191\u2193 to move \u00b7 enter to choose\x1b[0m")
         sys.stdout.write("\n".join(lines) + "\n")
         sys.stdout.flush()
