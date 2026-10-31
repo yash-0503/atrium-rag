@@ -510,31 +510,107 @@ def _menu(
     allow_other: bool = False,
     default: str = "1",
 ) -> str:
-    """A numbered menu. Returns the chosen key.
+    """A menu the operator moves through, not one they type at.
 
-    Every choice the operator can make is a choice they pick from a
-    list, because a name they have to remember is a name they can get
-    wrong. `allow_other` adds a last option for typing something the
-    list does not have.
+    Arrow keys move the cursor, Enter chooses, and a digit jumps
+    straight to an entry. When the input is not a terminal — CI, a
+    pipe — it falls back to typing a number, because a menu that
+    needs a keyboard is no use to a script.
     """
+    import sys
+
     import typer
 
-    console.print()
-    console.print(f"[bold]{title}[/]")
-    for index, (key, note) in enumerate(options, start=1):
-        console.print(f"  [dim]{index}.[/] {key:<34} [dim]{note}[/]")
+    choices = list(options)
     if allow_other:
-        console.print(
-            f"  [dim]{len(options) + 1}.[/] {'type another name':<34} "
-            "[dim]anything else[/]"
-        )
-    choice = typer.prompt("\u203a", default=default).strip()
-    if allow_other and choice == str(len(options) + 1):
+        choices.append(("type another name", "anything else"))
+
+    if not sys.stdin.isatty():
+        console.print()
+        console.print(f"[bold]{title}[/]")
+        for index, (key, note) in enumerate(choices, start=1):
+            console.print(f"  [dim]{index}.[/] {key:<34} [dim]{note}[/]")
+        raw = typer.prompt("\u203a", default=default).strip()
+        index = _safe_index(raw, len(choices)) - 1
+        if allow_other and index == len(choices) - 1:
+            return typer.prompt("name", default="").strip()
+        return choices[max(0, min(index, len(choices) - 1))][0]
+
+    return _menu_tty(title, choices, allow_other)
+
+
+def _menu_tty(
+    title: str,
+    choices: List[Tuple[str, str]],
+    allow_other: bool,
+) -> str:
+    """The arrow-key menu, drawn in place.
+
+    Written with plain ANSI rather than rich, because the cursor has to
+    be moved and the lines redrawn between keypresses, and rich's
+    output model is a stream, not a screen.
+    """
+    import os
+    import sys
+    import termios
+    import tty
+
+    index = 0
+    drawn = 0
+
+    def render() -> None:
+        nonlocal drawn
+        if drawn:
+            sys.stdout.write(f"\x1b[{drawn}A\x1b[J")
+        lines = [f"\x1b[1m{title}\x1b[0m"]
+        for position, (key, note) in enumerate(choices):
+            marker = "\x1b[36m\u276f\x1b[0m" if position == index else " "
+            weight = "\x1b[1m" if position == index else ""
+            lines.append(f" {marker} {weight}{key:<34}\x1b[0m \x1b[2m{note}\x1b[0m")
+        lines.append(" \x1b[2m\u2191\u2193 to move \u00b7 enter to choose\x1b[0m")
+        sys.stdout.write("\n".join(lines) + "\n")
+        sys.stdout.flush()
+        drawn = len(lines)
+
+    fd = sys.stdin.fileno()
+    saved = termios.tcgetattr(fd)
+    try:
+        tty.setraw(fd)
+        render()
+        while True:
+            char = os.read(fd, 1)
+            if char in (b"\r", b"\n"):
+                break
+            if char == b"\x03" or char == b"\x04":
+                raise KeyboardInterrupt
+            if char == b"\x1b":
+                sequence = os.read(fd, 2)
+                if sequence == b"[A":
+                    index = (index - 1) % len(choices)
+                elif sequence == b"[B":
+                    index = (index + 1) % len(choices)
+                elif sequence == b"[C":
+                    index = (index + 1) % len(choices)
+                elif sequence == b"[D":
+                    index = (index - 1) % len(choices)
+            elif char.isdigit():
+                number = int(char)
+                if 1 <= number <= len(choices):
+                    index = number - 1
+            else:
+                continue
+            render()
+    finally:
+        termios.tcsetattr(fd, termios.TCSADRAIN, saved)
+        sys.stdout.write("\n")
+        sys.stdout.flush()
+
+    if allow_other and index == len(choices) - 1:
+        import typer
+
         return typer.prompt("name", default="").strip()
-    index = _safe_index(choice, len(options) + (1 if allow_other else 0)) - 1
-    if index < 0 or index >= len(options):
-        return options[0][0]
-    return options[index][0]
+    return choices[index][0]
+
 
 
 def _summary_line(values: Dict[str, str]) -> List[Tuple[str, str]]:
