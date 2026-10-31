@@ -914,6 +914,17 @@ def _setup_failed(exc) -> None:
     raise typer.Exit(code=1)
 
 
+
+def _embed_or_fail(embedder, texts):
+    """Embed, turning a setup problem into a sentence and a way out."""
+    from atrium.errors import AtriumSetupError
+
+    try:
+        return embedder.embed(texts)
+    except AtriumSetupError as exc:
+        _setup_failed(exc)
+
+
 def _build_runtime():
     """Construct the parser, embedder and vector DB from the resolved
     configuration. Imported lazily so `atrium --help` stays fast.
@@ -1147,7 +1158,7 @@ def search(
             )
 
     with console.status("[accent]Searching…[/]"):
-        vector = embedder.embed([query])[0]
+        vector = _embed_or_fail(embedder, [query])[0]
         hits = retrieve_and_rerank(
             db, vector, query, k, reranker=reranker,
         )
@@ -1262,6 +1273,7 @@ def demo(
     Ingests one document into the configured vector store and searches
     it back. This is the "does the whole thing actually work?" command.
     """
+    from atrium.errors import AtriumSetupError
     from atrium.pipeline import ingest_document
 
     _quiet_logs(verbose)
@@ -1291,16 +1303,19 @@ def demo(
         raise typer.Exit(code=1) from None
 
     mime = _detect_mime(raw, filename)
-    with console.status("[accent]Ingesting…[/]"):
-        result = ingest_document(
-            doc_id="atrium-demo",
-            file_bytes=raw,
-            filename=filename,
-            mime_type=mime,
-            parser=parser,
-            embedder=embedder,
-            db=db,
-        )
+    try:
+        with console.status("[accent]Ingesting…[/]"):
+            result = ingest_document(
+                doc_id="atrium-demo",
+                file_bytes=raw,
+                filename=filename,
+                mime_type=mime,
+                parser=parser,
+                embedder=embedder,
+                db=db,
+            )
+    except AtriumSetupError as exc:
+        _setup_failed(exc)
     console.print(
         f"[ok]Ingested[/] {filename}: {result.elements_parsed} elements → "
         f"{result.chunks_written} chunks",
@@ -1308,9 +1323,12 @@ def demo(
 
     from atrium.retrieval import retrieve_and_rerank
 
-    with console.status("[accent]Searching…[/]"):
-        vector = embedder.embed([query])[0]
-        hits = retrieve_and_rerank(db, vector, query, 3)
+    try:
+        with console.status("[accent]Searching…[/]"):
+            vector = embedder.embed([query])[0]
+            hits = retrieve_and_rerank(db, vector, query, 3)
+    except AtriumSetupError as exc:
+        _setup_failed(exc)
 
     if not hits:
         console.print("[warn]No results — the corpus looks empty.[/]")
