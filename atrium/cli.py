@@ -30,6 +30,7 @@ what a setting means.
 
 from __future__ import annotations
 
+import os
 import sys
 import time
 from pathlib import Path
@@ -912,21 +913,40 @@ _INGESTABLE_SUFFIXES = {
 _SKIP_DIR_NAMES = {".git", ".venv", "venv", "__pycache__", "node_modules", ".mypy_cache"}
 
 
+
+def _walk_files(root: Path):
+    """Every ingestable file under `root`, not following symlinked directories.
+
+    `Path.rglob` follows directory symlinks, so `atrium ingest ~/link`
+    could walk the entire filesystem when the link points at `/`. A
+    symlinked *file* is still read — the operator named it — but a
+    symlinked *directory* is not descended into, because that is how a
+    walk escapes the tree it was pointed at.
+    """
+    for dirpath, dirnames, filenames in os.walk(root, followlinks=False):
+        dirnames[:] = sorted(
+            name
+            for name in dirnames
+            if name not in _SKIP_DIR_NAMES and not name.startswith(".")
+        )
+        for name in sorted(filenames):
+            if name.startswith("."):
+                continue
+            child = Path(dirpath) / name
+            if not child.is_file():
+                continue
+            if child.suffix.lower() in _INGESTABLE_SUFFIXES:
+                yield child
+
+
 def _collect_files(paths: Sequence[str]) -> List[Path]:
     """Expand the given paths into a list of ingestable files."""
     out: List[Path] = []
     for raw in paths:
         p = Path(raw).expanduser()
         if p.is_dir():
-            for child in sorted(p.rglob("*")):
-                if not child.is_file():
-                    continue
-                if any(part in _SKIP_DIR_NAMES for part in child.parts):
-                    continue
-                if child.name.startswith("."):
-                    continue
-                if child.suffix.lower() in _INGESTABLE_SUFFIXES:
-                    out.append(child)
+            for child in _walk_files(p):
+                out.append(child)
         elif p.is_file():
             out.append(p)
         else:

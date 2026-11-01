@@ -320,8 +320,13 @@ async def lifespan(app: FastAPI):
     # refuses to start because the embedder is briefly down is worse
     # than one that starts, says so, and answers with the reason.
     probe = getattr(embedder, "probe", None)
-    if probe is not None:
-        reachable, detail = probe()
+    if callable(probe):
+        try:
+            reachable, detail = probe()
+        except Exception as exc:
+            # A probe that misbehaves is not a reason to refuse to
+            # start; the service would answer with the real error.
+            reachable, detail = False, f"{type(exc).__name__}: {exc}"
         if not reachable:
             log.warning(
                 "the embedding endpoint is not answering (%s). The service "
@@ -367,7 +372,16 @@ async def lifespan(app: FastAPI):
             type(exc).__name__, exc,
         )
         _abort_startup(_store_unreachable_message(exc))
-    yield
+    try:
+        yield
+    finally:
+        # The store holds a connection pool — for pgvector, worker
+        # threads and open connections. Nothing closed it, so a reload
+        # or a shutdown left them behind.
+        try:
+            _get_db().close()
+        except Exception as exc:  # pragma: no cover - shutdown path
+            log.warning("could not close the vector store: %s", exc)
 
 
 app = FastAPI(title="Atrium", lifespan=lifespan)
@@ -589,11 +603,20 @@ async def search(body: SearchRequest):
             "parent_section_path": hit.get("parent_section_path") or [],
         })
 
+    # How many chunks the store holds. Without it, an empty result is
+    # ambiguous: an empty corpus and a query that matched nothing look
+    # the same, and "is my data even in there?" has no answer.
+    try:
+        corpus_chunks = _get_db().count_chunks()
+    except Exception:
+        corpus_chunks = None
+
     return {
         "query": query,
         "top_k": top_k,
         "rerank": reranker is not None,
         "count": len(results),
+        "corpus_chunks": corpus_chunks,
         "took_ms": int((time.monotonic() - started) * 1000),
         "results": results,
     }
@@ -966,6 +989,15 @@ async def preview_chunks(
         from atrium.smart_chunker import resolve_chunk_config
 
         strategy = resolve_chunk_config(mode, config).strategy
+        # The response is the whole document's chunks. A 100 MB document
+        # is thousands of them, and the caller asked to look at the
+        # structure, not to download the corpus.
+        total_chunks = len(smart_chunks)
+        preview_cap = env_int("MAX_PREVIEW_CHUNKS")
+        truncated = False
+        if preview_cap and total_chunks > preview_cap:
+            smart_chunks = smart_chunks[:preview_cap]
+            truncated = True
         formatted_chunks = []
         for sc in smart_chunks:
             formatted_chunks.append({
@@ -984,7 +1016,8 @@ async def preview_chunks(
 
         return {
             "filename": upload_name,
-            "total_chunks": len(formatted_chunks),
+            "total_chunks": total_chunks,
+            "truncated": truncated,
             "chunking_mode": mode,
             "chunking_strategy": strategy,
             "chunks": formatted_chunks
@@ -1165,11 +1198,29 @@ def _retrieval_lab_get(session_id: str) -> Optional[_RetrievalLabSession]:
 
 
 def _retrieval_lab_put(session_id: str, sess: _RetrievalLabSession) -> None:
-    """Store a session and evict oldest if over the cap."""
+    """Store a session and evict the oldest ones over the caps.
+
+    Two caps: the number of sessions, and the number of chunks they
+    hold between them. The second one is the one that matters — sixteen
+    sessions of a large document is a lot of memory, and the session
+    count alone did not bound it.
+    """
     _retrieval_lab_sessions[session_id] = sess
     _retrieval_lab_sessions.move_to_end(session_id)
     while len(_retrieval_lab_sessions) > _RETRIEVAL_LAB_MAX_SESSIONS:
         _retrieval_lab_sessions.popitem(last=False)
+
+    total_cap = env_int("MAX_LAB_TOTAL_CHUNKS")
+    while total_cap and _lab_total_chunks() > total_cap:
+        oldest = next(iter(_retrieval_lab_sessions), None)
+        if oldest is None or oldest == session_id:
+            break
+        _retrieval_lab_sessions.popitem(last=False)
+
+
+def _lab_total_chunks() -> int:
+    """How many chunks the lab is holding."""
+    return sum(len(sess.chunks) for sess in _retrieval_lab_sessions.values())
 
 
 @app.post("/retrieval_lab/prepare")
@@ -1221,6 +1272,21 @@ async def retrieval_lab_prepare(
     except Exception as exc:
         log.warning("retrieval_lab/prepare parse/chunk failed: %s", exc)
         raise HTTPException(422, f"Parse or chunk failed: {exc}") from exc
+
+    # The lab holds a document's chunks *and* their embeddings in memory,
+    # for as long as the session lives. A document with ten thousand
+    # chunks is ten thousand vectors, and sixteen such sessions is a
+    # hundred megabytes of process. The cap is applied before the
+    # embedding call, so the cost is bounded too.
+    lab_cap = env_int("MAX_LAB_CHUNKS_PER_SESSION")
+    truncated = False
+    if lab_cap and len(smart_chunks) > lab_cap:
+        log.warning(
+            "retrieval_lab/prepare: %d chunks, keeping the first %d",
+            len(smart_chunks), lab_cap,
+        )
+        smart_chunks = smart_chunks[:lab_cap]
+        truncated = True
 
     # Project smart_chunker.ChunkRecord into a flat dict for the JSON wire.
     # Mirrors the chunk shape /preview returns minus embed_text internals.
@@ -1315,6 +1381,7 @@ async def retrieval_lab_prepare(
 
     return {
         "session_id": session_id,
+        "truncated": truncated,
         "filename": _upload_filename(file),
         "mime": mime,
         "chunking_mode": chunking_mode or "auto",

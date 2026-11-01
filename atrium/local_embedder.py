@@ -55,7 +55,12 @@ class FastEmbedEmbedder:
         return list(TextEmbedding.list_supported_models())
 
     def _lookup_dim(self, model: str) -> int:
-        """The model's dimension, read from fastembed's own catalogue."""
+        """The model's dimension.
+
+        The pinned table wins: a model we know the width of must not
+        change width because a dependency was upgraded. The catalogue is
+        only consulted for a model we have not pinned.
+        """
         if model in SUGGESTED_MODELS:
             return SUGGESTED_MODELS[model]
         try:
@@ -80,6 +85,9 @@ class FastEmbedEmbedder:
 
         try:
             vectors = self._get().embed(list(texts))
+            self._check_dimension(vectors)
+        except AtriumSetupError:
+            raise
         except Exception as exc:
             raise AtriumSetupError(
                 f"The local embedder could not load {self.model_name}: {exc}",
@@ -89,6 +97,30 @@ class FastEmbedEmbedder:
                 ),
             ) from exc
         return [[float(v) for v in vector] for vector in vectors]
+
+    def _check_dimension(self, vectors: Sequence[Sequence[float]]) -> None:
+        from atrium.errors import AtriumSetupError
+
+        """The model's output must match the pinned dimension.
+
+        The dimension is pinned per model so that a fastembed release
+        which changes a model's output cannot silently change the
+        width of the vectors in the store — which the store would then
+        refuse, with a message about the wrong thing.
+        """
+        if not vectors:
+            return
+        expected = self.dimension
+        actual = len(vectors[0])
+        if expected and actual != expected:
+            raise AtriumSetupError(
+                f"{self.model_name} returned {actual} dimensions, but "
+                f"{expected} is pinned for it.",
+                hints=(
+                    "Pin a different model, or update the dimension in "
+                    "atrium/local_embedder.py and in EMBED_DIM",
+                ),
+            )
 
     @property
     def dimension(self) -> int:

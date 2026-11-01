@@ -296,11 +296,14 @@ class SqliteAdapter:
         self._corpus_cache = (usable, matrix)
         return self._corpus_cache
 
-    def chunk_count(self) -> int:
+    def count_chunks(self) -> int:
         """How many chunks the store holds."""
         conn = self._connect()
         row = conn.execute("SELECT COUNT(*) FROM chunks").fetchone()
         return int(row[0]) if row else 0
+
+    # The name the protocol uses.
+    chunk_count = count_chunks
 
 
     def _search(

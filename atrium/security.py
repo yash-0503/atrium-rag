@@ -24,7 +24,6 @@ from __future__ import annotations
 import logging
 import re
 import traceback
-from pathlib import Path
 from typing import List, Optional, Set
 
 from fastapi import HTTPException, Request, status
@@ -59,9 +58,13 @@ def api_key() -> str:
 
 
 # Routes that stay open even when API_KEY is set. /health for compose
-# healthcheck + uptime monitors; /visualize is a static page; /docs +
-# /openapi.json + /redoc are auto-generated schema browsers.
-_OPEN_ROUTES = frozenset({"/health", "/visualize", "/docs", "/openapi.json", "/redoc"})
+# healthcheck + uptime monitors; /visualize is a static page.
+#
+# The schema browsers are NOT in the list. With a key set, /docs,
+# /openapi.json and /redoc describe the whole API surface — every
+# route, every field — to anyone who asks. They are still reachable
+# when no key is set, which is the case they are for.
+_OPEN_ROUTES = frozenset({"/health", "/visualize"})
 
 
 def check_content_length(content_length_header: Optional[str]) -> None:
@@ -203,31 +206,19 @@ def log_redacted_traceback(exc: BaseException, where: str) -> None:
     )
 
 
-# Path-traversal protection (CLI)
-
-
-def safe_resolve(path: str, base: Optional[Path] = None) -> Path:
-    """Resolve a user-supplied path and verify it stays within `base`.
-
-    Used by any CLI subcommand that takes a local file path (e.g. a
-    future `atrium ingest <path>`). Mirrors the OWASP guidance for
-    command-line file ingestion: never trust the input, always resolve
-    to an absolute path and check that the resolved prefix starts with
-    the allowed base.
-
-    `base` defaults to the current working directory. Operators
-    running with `--base /srv/uploads` can constrain ingestion to a
-    specific directory tree.
-    """
-    base_path = (base or Path.cwd()).resolve()
-    candidate = Path(path).expanduser().resolve()
-    try:
-        candidate.relative_to(base_path)
-    except ValueError:
-        raise ValueError(
-            f"path {path!r} resolves outside the allowed base {base_path}"
-        ) from None
-    return candidate
+# Path traversal
+# -------------
+#
+# There is no path-traversal guard here, and there is not one in the
+# codebase at all. The one that used to be here (`safe_resolve`) was
+# never called: the HTTP API takes uploads, not paths, and the CLI
+# runs as the operator and may legitimately be pointed anywhere on
+# their own disk. Confining the CLI to the working directory would
+# break `atrium ingest ~/Documents/papers`, and a guard that is never
+# applied protects nothing. The traversal risk that *was* real — the
+# CLI's file walk following a symlinked directory out of the tree it
+# was pointed at — is fixed where it belongs, in the walk itself
+# (`atrium/cli.py::_walk_files`).
 
 
 # Diagnostics

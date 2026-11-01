@@ -132,6 +132,8 @@ class VectorDBAdapter(Protocol):
         current_run_id: str,
         batch_size: int = 100,
     ) -> None: ...
+    def count_chunks(self) -> int: ...
+    def close(self) -> None: ...
     def health(self) -> bool: ...
     # Task B (2026-10-10): retrieval protocol shared by atrium.retrieval.
     # Adapters must implement all four for `retrieve_and_rerank` to
@@ -391,6 +393,19 @@ class QdrantAdapter:
         self.delete_stale_chunks(doc_id, current_run_id)
         self.upsert(chunks, batch_size=batch_size)
 
+    def count_chunks(self) -> int:
+        """How many chunks the store holds."""
+        try:
+            return int(self.client.count(collection_name="documents", exact=True).count)
+        except Exception:
+            return 0
+
+    def close(self) -> None:
+        """Release the client's connections."""
+        close = getattr(self.client, "close", None)
+        if callable(close):
+            close()
+
     def health(self) -> bool:
         try: return self.client.get_collections() is not None
         except Exception: return False
@@ -612,6 +627,27 @@ class PgVectorAdapter:
                                 chunk.model_dump_json(exclude={"embedding"}),
                             ),
                         )
+
+    def count_chunks(self) -> int:
+        """How many chunks the store holds."""
+        try:
+            with self.pool.connection() as conn:
+                row = conn.execute("SELECT COUNT(*) FROM chunks").fetchone()
+                return int(row[0]) if row else 0
+        except Exception:
+            return 0
+
+    def close(self) -> None:
+        """Close the connection pool.
+
+        The pool holds worker threads and open connections. Nothing
+        closed it, so a process that reloaded, or one that was shut
+        down, left them behind — and the pool's threads are not
+        daemons, so the process could hang on the way out.
+        """
+        close = getattr(self.pool, "close", None)
+        if callable(close):
+            close()
 
     def health(self) -> bool:
         with _quiet_pool_logs():

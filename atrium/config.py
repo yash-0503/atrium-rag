@@ -63,6 +63,7 @@ Two access patterns, both reading from the same table:
 
 from __future__ import annotations
 
+import logging
 import os
 from dataclasses import dataclass, fields
 from pathlib import Path
@@ -95,6 +96,8 @@ __all__ = [
 # network, so a developer following the README on a laptop got
 # connection errors for services that were running perfectly.
 # ---------------------------------------------------------------------------
+
+log = logging.getLogger("ingest.config")
 
 DEFAULTS: Dict[str, str] = {
     # -- vector store ------------------------------------------------------
@@ -182,6 +185,16 @@ DEFAULTS: Dict[str, str] = {
     # different job stores and different corpora, and nothing would say
     # so. Set this to one directory and both agree.
     "ATRIUM_DATA_DIR": "",
+    # The retrieval lab keeps a document's chunks and their embeddings in
+    # memory, one session at a time. These bound that: a document with
+    # more chunks than the per-session cap is truncated, and the oldest
+    # sessions are evicted when the total is over the cap.
+    "MAX_LAB_CHUNKS_PER_SESSION": "5000",
+    "MAX_LAB_TOTAL_CHUNKS": "50000",
+    # How many chunks /preview returns. The endpoint exists to show a
+    # document's structure, and a 100 MB document is thousands of
+    # chunks of JSON.
+    "MAX_PREVIEW_CHUNKS": "500",
     "JOB_RETENTION_SECONDS": "86400",
     "RETRIEVAL_LAB_MAX_SESSIONS": "16",
 }
@@ -336,14 +349,35 @@ def env_str(name: str, default: Optional[str] = None) -> str:
     return DEFAULTS.get(name, "")
 
 
+
+#: Keys already reported as unparseable. The setting is read on hot
+#: paths, so the warning is issued once per key rather than per read.
+_WARNED_UNPARSEABLE: set = set()
+
+
+def _warn_unparseable(name: str, raw: str, expected: str) -> None:
+    """Say once that a setting could not be read."""
+    if name in _WARNED_UNPARSEABLE:
+        return
+    _WARNED_UNPARSEABLE.add(name)
+    log.warning(
+        "%s=%r is not %s; using the default instead", name, raw, expected,
+    )
+
+
 def env_int(name: str, default: Optional[int] = None) -> int:
-    """Read an integer setting. Unparseable values fall back."""
+    """Read an integer setting.
+
+    An unparseable value falls back to the default — and says so. It
+    used to fall back silently, so `EMBED_DIM=1024x` looked like a
+    configured 1024 until the store refused the vectors.
+    """
     raw = env_str(name)
     if raw:
         try:
             return int(raw)
         except ValueError:
-            pass
+            _warn_unparseable(name, raw, "an integer")
     if default is not None:
         return default
     try:
@@ -359,7 +393,7 @@ def env_float(name: str, default: Optional[float] = None) -> float:
         try:
             return float(raw)
         except ValueError:
-            pass
+            _warn_unparseable(name, raw, "a number")
     if default is not None:
         return default
     try:

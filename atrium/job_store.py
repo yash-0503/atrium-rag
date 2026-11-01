@@ -62,6 +62,22 @@ STATUS_COMPLETE = "complete"
 STATUS_FAILED = "failed"
 
 
+#: The columns `JobStore.update` may write. The names are
+#: interpolated into the statement, so the list is a whitelist, not a
+#: convention.
+_UPDATABLE_COLUMNS = frozenset({
+    "status",
+    "doc_id",
+    "chunks_written",
+    "error",
+    "ocr_failures",
+    "attempts",
+    "claimed_by",
+    "claimed_at",
+    "payload",
+})
+
+
 class JobStore:
     """Thin SQLite wrapper around a single `jobs` table."""
 
@@ -110,6 +126,12 @@ class JobStore:
         # Claim scan: pending jobs, oldest first.
         self._conn.execute(
             "CREATE INDEX IF NOT EXISTS idx_jobs_pending ON jobs(status, created_at)"
+        )
+        # Stale-claim scan: running jobs, oldest claim first. Without it
+        # the worker's recovery sweep scans the whole table on every
+        # poll.
+        self._conn.execute(
+            "CREATE INDEX IF NOT EXISTS idx_jobs_claimed ON jobs(status, claimed_at)"
         )
         self._migrate_legacy_columns()
 
@@ -278,6 +300,16 @@ class JobStore:
     def update(self, job_id: str, **fields: Any) -> None:
         if not fields:
             return
+        # Only the columns below may be written. The field names are
+        # interpolated into the SQL, so a name that came from anywhere
+        # else would be an injection; a whitelist makes that impossible
+        # rather than merely unlikely.
+        unknown = set(fields) - _UPDATABLE_COLUMNS
+        if unknown:
+            raise ValueError(
+                f"cannot update unknown job column(s): {sorted(unknown)}; "
+                f"allowed: {sorted(_UPDATABLE_COLUMNS)}"
+            )
         # JSON-encode list/dict values so they survive the TEXT column.
         encoded = {
             k: (json.dumps(v) if isinstance(v, (list, dict)) else v)
