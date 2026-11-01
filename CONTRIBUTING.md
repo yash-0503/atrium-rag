@@ -6,7 +6,7 @@ Thanks for taking a look. This is a small library, so the bar is mostly
 ## Set up
 
 ```bash
-git clone https://github.com/ItsMeYash777/atrium-rag
+git clone https://github.com/yash-0503/atrium-rag
 cd atrium-rag
 python3 -m venv .venv && source .venv/bin/activate
 pip install -e ".[dev]"

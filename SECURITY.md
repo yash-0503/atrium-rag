@@ -5,7 +5,7 @@
 Please **do not open a public issue** for a security problem.
 
 Use **GitHub's private vulnerability reporting**:
-<https://github.com/ItsMeYash777/atrium-rag/security/advisories/new>
+<https://github.com/yash-0503/atrium-rag/security/advisories/new>
 
 (That link works once *Settings -> Security -> Private vulnerability
 reporting* is enabled on the repository. If it is not, email the
