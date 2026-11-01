@@ -176,3 +176,8 @@ logs/
 
 # The eval_v2 parse cache: parsed blocks and chunks, rebuilt by the run.
 eval_v2/parse_cache/
+
+# Internal working documents. They live in the staging checkout
+# (~/Desktop/rag-ingest/docs/), not in the published repository.
+RELEASE_READINESS.md
+ATRIUM_RESILIENCE_AUDIT.md
