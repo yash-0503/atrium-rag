@@ -9,7 +9,7 @@ pip install atrium-rag
 ![atrium benchmark: R@5 0.700 on 23 documents — Docling 0.686, Unstructured 0.614](docs/images/benchmark.png)
 
 - **Python:** 3.10+
-- **Vector DB:** Qdrant (default) or pgvector
+- **Vector DB:** SQLite (default), Qdrant or pgvector
 - **Embeddings:** any OpenAI-compatible `/v1/embeddings` endpoint (Ollama, OpenAI, vLLM, LM Studio, TEI)
 - **License:** MIT
 
@@ -134,10 +134,15 @@ variable beats `.env`, and `.env` beats the built-in default.
 | `VISION_MODEL` | `minicpm-v4.6:1b` | Vision model tag |
 | `ATRIUM_PDF_BACKEND` | `pdfplumber` | PDF library: `pdfplumber` or `pymupdf` |
 | `API_KEY` | — | Bearer token; empty = no auth (dev only) |
-| `MAX_UPLOAD_BYTES` | `104857600` | Upload cap (100 MB) |
 | `ALLOWED_MIME_TYPES` | — | Comma-separated allowlist; empty = any |
 | `JOB_DB_PATH` | `jobs.db` | The async job queue (SQLite) |
 | `INGEST_CONCURRENCY` | `4` | Documents ingested at once |
+| `ATRIUM_DATA_DIR` | — | Where the local files live; the API and the worker must agree |
+| `MAX_UPLOAD_BYTES` | `104857600` | Upload cap (100 MB) |
+| `MAX_FILES_PER_REQUEST` | `32` | Files in one `/ingest` request |
+| `MAX_CHUNKS_PER_DOCUMENT` | `50000` | Ceiling on one document's chunks |
+| `MAX_JOB_ATTEMPTS` | `3` | Attempts before a job is given up on |
+| `JOB_RETENTION_SECONDS` | `86400` | How long a finished job row is kept |
 | `LOG_LEVEL` | `INFO` | `DEBUG`…`ERROR` |
 
 `.env.example` has the full list with comments.
@@ -185,6 +190,8 @@ the `local` extra, which needs no server and no key.
 | `POST /search` | Search the corpus |
 | `POST /preview` | Parse + chunk without embedding or storing |
 | `GET /retrieval_lab` | In-browser sandbox for a single document |
+| `POST /retrieval_lab/prepare` | Load a document into the sandbox |
+| `POST /retrieval_lab/search` | Query the sandbox |
 | `GET /health` | Liveness + dependency probe |
 | `GET /visualize` | Chunk visualiser |
 
@@ -206,6 +213,7 @@ omitted follows `RERANK_ENABLED`.
   "top_k": 8,
   "rerank": false,
   "count": 8,
+  "corpus_chunks": 1451,
   "took_ms": 41,
   "results": [
     {
@@ -263,6 +271,7 @@ every chunk, so a corpus with mixed strategies stays auditable.
 | `atrium reingest` | Re-chunk an existing document |
 | `atrium demo` | Ingest one document and search it back |
 | `atrium serve` | Run the API |
+| `atrium version` | Print the version |
 
 ---
 
@@ -391,6 +400,12 @@ difference is inside the confidence interval, which the report states
 with the interval. The separation is in cost: atrium parses the corpus
 in a sixth of the time and a third of the memory.
 
+The hard, implicit and unanswerable tiers are machine-drafted and
+queued for human sign-off; `python -m eval_v2.review_cli status`
+reports how many are still open, and the harness prints that count on
+every run. The numbers above are from the run in which those questions
+were still open, so read them as provisional.
+
 The harness, the corpus and the exact commands are published in the
 `atrium-benchmarks` repository, so the numbers can be reproduced. See
 `docs/benchmark/final_result.md` there for the intervals, the per-tier
@@ -400,9 +415,18 @@ breakdown and the failure attribution.
 
 ## Limitations
 
+- **The sparse ranker is not reachable.** BM25 and the confidence gate
+  that fuses it are in the library, but no endpoint or command passes
+  them a sparse index, so retrieval is dense (+ an optional rerank).
+- **OCR on a noisy scan is weak.** The OCR path returns an empty string
+  for a page it cannot read; the count of unreadable pages is reported
+  on the job row, but the text is not recovered.
 - **CJK / Arabic BM25** tokenization is not script-aware yet.
 - **No distributed job queue** — workers share a SQLite file. There is
   no Redis / Kafka / Celery and no Postgres job store.
+- **The local store is a file, not a search engine.** Its query scans
+  every stored vector; past roughly twenty thousand chunks it is the
+  wrong tool (see *Vector stores*).
 - **mypy is advisory.** ~30 pre-existing `Optional`-narrowing findings,
   mostly in the PDF parser's geometry helpers.
 - **`/visualize`** loads Tailwind from a CDN; there is no offline build.

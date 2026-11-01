@@ -84,7 +84,10 @@ class FastEmbedEmbedder:
         from atrium.errors import AtriumSetupError
 
         try:
-            vectors = self._get().embed(list(texts))
+            # fastembed returns a generator of arrays, which cannot be
+            # indexed — it has to be materialised before it can be
+            # checked or converted.
+            vectors = list(self._get().embed(list(texts)))
             self._check_dimension(vectors)
         except AtriumSetupError:
             raise
@@ -92,7 +95,7 @@ class FastEmbedEmbedder:
             raise AtriumSetupError(
                 f"The local embedder could not load {self.model_name}: {exc}",
                 hints=(
-                    'Install the extra: `pip install "atrium-rag[local]"`',
+                    "Install the extra: `pip install \"atrium-rag[local]\"`",
                     "Or use an OpenAI-compatible endpoint instead: `atrium init`",
                 ),
             ) from exc

@@ -1153,7 +1153,7 @@ def get_visualizer_ui():
 # stored embeddings. No Qdrant, no jobs.db, no worker. Sessions LRU-evict
 # at _RETRIEVAL_LAB_MAX_SESSIONS so a long-lived process doesn't grow
 # unbounded. The global `parser` from module load is reused, so env-flag
-# toggles (OCR_ENABLED, LAYOUT_ENABLED, etc.) are honored here too.
+# toggles (OCR_ENABLED, VISION_ENABLED) are honored here too.
 
 # Cap on concurrently-held lab sessions. 17th prepare evicts the LRU one.
 _RETRIEVAL_LAB_MAX_SESSIONS = env_int("RETRIEVAL_LAB_MAX_SESSIONS")

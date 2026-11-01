@@ -72,7 +72,7 @@ console = Console(theme=THEME)
 
 
 def _err_console() -> Console:
-    Console(theme=THEME, stderr=True)
+    return Console(theme=THEME, stderr=True)
 
 
 
@@ -968,9 +968,14 @@ def _setup_failed(exc) -> None:
     A missing service or an unset variable is not a crash: it is a
     sentence and a way out.
     """
-    _err_console().print(f"[bad]{exc.message}[/]")
+    # The message and the hints are plain text — escaping them keeps a
+    # command like `pip install "atrium-rag[local]"` from being read
+    # as console markup and silently losing its brackets.
+    from rich.markup import escape
+
+    _err_console().print(f"[bad]{escape(exc.message)}[/]")
     for hint in getattr(exc, "hints", ()):  # pragma: no branch
-        _err_console().print(f"  [dim]{hint}[/]")
+        _err_console().print(f"  [dim]{escape(hint)}[/]")
     raise typer.Exit(code=1)
 
 

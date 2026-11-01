@@ -1,4 +1,4 @@
-"""
+r"""
 atrium/bm25.py
 
 Pure-Python BM25 (Okapi) sparse retriever, used to compose hybrid
