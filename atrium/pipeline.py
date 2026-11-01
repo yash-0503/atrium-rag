@@ -1,3 +1,4 @@
+import logging
 import threading
 import uuid
 from dataclasses import dataclass
@@ -5,6 +6,8 @@ from typing import List, Optional
 
 from atrium.adapters import EmbeddingAdapter, VectorDBAdapter
 from atrium.models import ChunkRecord, SourceMetadata
+
+log = logging.getLogger("ingest.pipeline")
 
 # 2026-10-17: was `chunk_elements` (legacy structure-aware path). Now
 # routes through the dispatcher so /jobs picks up the same chunking
@@ -37,6 +40,35 @@ def doc_lock(doc_id: str):
             lock = threading.Lock()
             _DOC_LOCKS[doc_id] = lock
     return lock
+
+
+
+def _check_document_size(elements, chunks) -> None:
+    """Refuse a document that is too big to ingest.
+
+    The upload cap bounds the bytes; this bounds what those bytes turn
+    into. A 100 MB PDF can be ten thousand pages, and every page
+    becomes chunks, and every chunk becomes a vector that is held in
+    memory until the whole document has been embedded. Without a
+    ceiling, a legal upload is a way to take the process out of memory.
+    """
+    from atrium.config import env_int
+
+    max_chunks = env_int("MAX_CHUNKS_PER_DOCUMENT")
+    max_pages = env_int("MAX_PAGES_PER_DOCUMENT")
+
+    if max_chunks and len(chunks) > max_chunks:
+        raise ValueError(
+            f"this document produces {len(chunks)} chunks, which is over the "
+            f"limit of {max_chunks}. Split it, or raise "
+            f"MAX_CHUNKS_PER_DOCUMENT."
+        )
+    pages = [e.page for e in elements if getattr(e, "page", None)]
+    if max_pages and pages and max(pages) > max_pages:
+        raise ValueError(
+            f"this document has {max(pages)} pages, which is over the limit "
+            f"of {max_pages}. Split it, or raise MAX_PAGES_PER_DOCUMENT."
+        )
 
 
 def _build_chunk_record(
@@ -104,6 +136,11 @@ class IngestResult:
     chunks_written: int
     elements_parsed: int
     chunking_mode: str
+    #: Pages the OCR engine could not read. Zero for a document that was
+    #: not scanned. It is reported rather than swallowed, because a
+    #: scanned document that OCRed to nothing still looks like a
+    #: successful ingest otherwise.
+    ocr_failures: int = 0
 
 
 def ingest_document(
@@ -144,7 +181,11 @@ def ingest_document(
         mode=chunking_mode, config=chunking_config,
     )
 
-    # 3. Map to FastAPI/DB-compatible ChunkRecord. v1 metadata
+    # 3. Refuse a document that would cost more than the deployment
+    #    allows, before the embedding cost is incurred.
+    _check_document_size(raw_elements, smart_chunks)
+
+    # 4. Map to FastAPI/DB-compatible ChunkRecord. v1 metadata
     # (parent_id, is_parent, child_ids, schema_version) is propagated
     # in _build_chunk_record — flat chunkers leave everything at the
     # v0 defaults; parent-child chunkers populate the four fields
@@ -154,7 +195,7 @@ def ingest_document(
         _build_chunk_record(sc, ingest_run_id) for sc in smart_chunks
     ]
 
-    # 4. Embed & Upsert in batches — embed against embed_text (text +
+    # 5. Embed & Upsert in batches — embed against embed_text (text +
     # heading breadcrumb) so retrieval gets the section context the
     # chunker already built, not just the bare display text.
     batch_size = 100
@@ -164,7 +205,7 @@ def ingest_document(
         for c, emb in zip(batch, embeddings):
             c.embedding = emb
 
-    # 5. Write this version and remove the previous one, as one
+    # 6. Write this version and remove the previous one, as one
     #    operation, under a lock on this document.
     #
     #    `replace_chunks` is atomic where the store can be (SQLite runs
@@ -181,6 +222,7 @@ def ingest_document(
         chunks_written=len(chunks),
         elements_parsed=len(raw_elements),
         chunking_mode=chunking_mode,
+        ocr_failures=int(getattr(parser, "last_parse_ocr_failures", 0) or 0),
     )
 
 
@@ -203,8 +245,19 @@ def run_ingestion(job_id: str, doc_id: str, file_bytes: bytes, filename: str, mi
             chunking_config=chunking_config,
         )
         job_store.update(
-            job_id, status="complete", chunks_written=result.chunks_written,
+            job_id,
+            status="complete",
+            chunks_written=result.chunks_written,
+            ocr_failures=result.ocr_failures,
         )
+        if result.ocr_failures:
+            # The document is in the corpus, but some of its pages were
+            # not readable. Saying so is the difference between "your
+            # scan was not OCRed" and "why is my document empty?".
+            log.warning(
+                "job %s: %d page(s) could not be read by OCR",
+                job_id, result.ocr_failures,
+            )
     except Exception as e:
         job_store.update(job_id, status="failed", error=str(e))
         # The failure is recorded on the job row *and* raised. Swallowing

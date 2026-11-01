@@ -160,6 +160,29 @@ DEFAULTS: Dict[str, str] = {
     "WORKER_JOB_TIMEOUT": "0",
     # -- misc --------------------------------------------------------------
     "LOG_LEVEL": "INFO",
+    # The address `atrium serve` binds. Loopback by default: a fresh
+    # install should not expose an unauthenticated ingest endpoint to
+    # the network. Set ATRIUM_BIND=0.0.0.0, or pass `--host 0.0.0.0`,
+    # to serve beyond this machine on purpose.
+    "ATRIUM_BIND": "127.0.0.1",
+    # Ceilings on what one document may cost. A 100 MB upload is a
+    # legal request, but it can be ten thousand pages, and every page
+    # becomes chunks, and every chunk becomes a 4 KB vector held in
+    # memory until the whole document is embedded. These bound that.
+    "MAX_CHUNKS_PER_DOCUMENT": "50000",
+    "MAX_PAGES_PER_DOCUMENT": "10000",
+    # How many files one /ingest request may carry. Each file is read
+    # into memory while it is ingested, so this bounds the request.
+    "MAX_FILES_PER_REQUEST": "32",
+    # How many times a job may be attempted before it is given up on,
+    # and how long a finished job row is kept.
+    "MAX_JOB_ATTEMPTS": "3",
+    # Where the local files live when their path is relative. Two
+    # processes with different working directories would otherwise use
+    # different job stores and different corpora, and nothing would say
+    # so. Set this to one directory and both agree.
+    "ATRIUM_DATA_DIR": "",
+    "JOB_RETENTION_SECONDS": "86400",
     "RETRIEVAL_LAB_MAX_SESSIONS": "16",
 }
 
@@ -262,6 +285,34 @@ def load_env_file(
 # ---------------------------------------------------------------------------
 # Typed accessors — the live view of the configuration
 # ---------------------------------------------------------------------------
+
+
+
+def data_dir() -> Path:
+    """The directory the local files live in.
+
+    `ATRIUM_DATA_DIR` when it is set, otherwise the process's working
+    directory. The API and the worker must agree on this: they share
+    the job queue and (with the local store) the corpus.
+    """
+    raw = env_str("ATRIUM_DATA_DIR")
+    if raw:
+        return Path(raw).expanduser().resolve()
+    return Path.cwd()
+
+
+def data_path(name: str, default: str) -> Path:
+    """An absolute path for a local file.
+
+    A relative path is resolved against `data_dir()` and logged, so
+    two processes that disagree show it in two log lines instead of
+    silently using two different files.
+    """
+    raw = env_str(name) or default
+    candidate = Path(raw).expanduser()
+    if candidate.is_absolute():
+        return candidate
+    return (data_dir() / candidate).resolve()
 
 
 def env_str(name: str, default: Optional[str] = None) -> str:

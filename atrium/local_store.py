@@ -56,9 +56,21 @@ class SqliteAdapter:
 
     name = "sqlite"
 
+    #: The corpus size at which the local store stops being the right
+    #: choice. The search is a full scan of every stored vector, so the
+    #: cost grows with the corpus: about 23 ms at a thousand chunks and
+    #: about 320 ms at twenty thousand. Past that, use Qdrant or
+    #: pgvector.
+    RECOMMENDED_MAX_CHUNKS = 20_000
+
     def __init__(self, path: str = "atrium_local.db") -> None:
         self.path = path
         self._lock = threading.Lock()
+        # The corpus, loaded once and kept. Every query used to read
+        # every vector back out of SQLite and recompute the matrix, so
+        # the cost of a search grew with the corpus *and* was paid in
+        # disk reads on every single query.
+        self._corpus_cache: Optional[tuple] = None
         self._conn: Optional[sqlite3.Connection] = None
 
     # -- connection -----------------------------------------------------
@@ -137,6 +149,7 @@ class SqliteAdapter:
         import struct
 
         conn = self._connect()
+        self._corpus_cache = None
         rows = []
         for chunk in chunks:
             vector = list(getattr(chunk, "embedding", None) or [])
@@ -172,6 +185,7 @@ class SqliteAdapter:
                 (doc_id, current_run_id),
             )
             conn.commit()
+            self._corpus_cache = None
 
     def replace_chunks(
         self,
@@ -208,6 +222,7 @@ class SqliteAdapter:
 
         with self._lock:
             conn.execute("BEGIN IMMEDIATE")
+            self._corpus_cache = None
             try:
                 conn.execute(
                     "DELETE FROM chunks WHERE doc_id = ? AND ingest_run_id != ?",
@@ -253,6 +268,41 @@ class SqliteAdapter:
         """v1 path: children only; parents are excluded."""
         return self._search(query_vector, top_k, score_threshold, children_only=True)
 
+    def _load_corpus(self):
+        """The stored corpus as one matrix, loaded once.
+
+        Returns `(rows, matrix)`, where `matrix` is the float32 array of
+        every vector, row-aligned with `rows`.
+        """
+        cached = self._corpus_cache
+        if cached is not None:
+            return cached
+
+
+        import numpy as np
+
+        conn = self._connect()
+        rows = conn.execute(
+            "SELECT chunk_id, doc_id, text, dim, vector, payload FROM chunks"
+        ).fetchall()
+        if not rows:
+            self._corpus_cache = ([], np.zeros((0, 0), dtype=np.float32))
+            return self._corpus_cache
+
+        dim = int(rows[0]["dim"] or 0)
+        usable = [row for row in rows if int(row["dim"] or 0) == dim]
+        buffer = b"".join(row["vector"] for row in usable)
+        matrix = np.frombuffer(buffer, dtype=np.float32).reshape(len(usable), dim)
+        self._corpus_cache = (usable, matrix)
+        return self._corpus_cache
+
+    def chunk_count(self) -> int:
+        """How many chunks the store holds."""
+        conn = self._connect()
+        row = conn.execute("SELECT COUNT(*) FROM chunks").fetchone()
+        return int(row[0]) if row else 0
+
+
     def _search(
         self,
         query_vector: List[float],
@@ -262,39 +312,28 @@ class SqliteAdapter:
     ) -> List[Dict[str, Any]]:
         import numpy as np
 
-        conn = self._connect()
-        rows = conn.execute(
-            "SELECT chunk_id, doc_id, text, dim, vector, payload FROM chunks"
-        ).fetchall()
+        rows, matrix = self._load_corpus()
         if not rows:
             return []
 
         query = np.asarray(query_vector, dtype=np.float32)
         if query.ndim != 1 or query.size == 0:
             return []
+        if matrix.shape[1] != query.size:
+            return []
 
         # The vectors are stored as raw float32, so the whole corpus is
-        # one buffer and the cosine is one matrix product. Doing this
+        # one matrix and the cosine is one matrix product. Doing this
         # in Python — unpacking and multiplying row by row — costs
         # 160 ms on a thousand chunks, which is the difference between
         # a search that feels instant and one that does not.
-        keep = [
-            index
-            for index, row in enumerate(rows)
-            if int(row["dim"] or 0) == query.size
-        ]
-        if not keep:
-            return []
-        buffer = b"".join(rows[index]["vector"] for index in keep)
-        matrix = np.frombuffer(buffer, dtype=np.float32).reshape(len(keep), query.size)
         norms = np.linalg.norm(matrix, axis=1, keepdims=True)
         norms[norms == 0] = 1.0
         query_norm = float(np.linalg.norm(query)) or 1.0
         scores = (matrix @ query).ravel() / (norms.ravel() * query_norm)
 
         scored: List[Dict[str, Any]] = []
-        for position, index in enumerate(keep):
-            row = rows[index]
+        for position, row in enumerate(rows):
             payload = json.loads(row["payload"] or "{}")
             if children_only and bool(payload.get("is_parent", False)):
                 continue

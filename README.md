@@ -114,6 +114,7 @@ variable beats `.env`, and `.env` beats the built-in default.
 | Variable | Default | What it does |
 |---|---|---|
 | `VECTOR_DB` | `sqlite` | `sqlite`, `qdrant` or `pgvector` |
+| `ATRIUM_BIND` | `127.0.0.1` | The address `atrium serve` binds |
 | `LOCAL_DB_PATH` | `atrium_local.db` | Where the local store keeps its file |
 | `QDRANT_HOST` / `QDRANT_PORT` | `localhost` / `6333` | Qdrant address |
 | `PG_CONN` | — | Postgres DSN, when `VECTOR_DB=pgvector` |
@@ -159,6 +160,12 @@ The local store is a SQLite file plus a cosine search over it — the
 standard library and nothing else, no server, no Docker, no container.
 It is the default so that a fresh install works before you install
 anything else.
+
+Its search scans every stored vector, so its cost grows with the
+corpus: about 5 ms at a thousand chunks, about 30 ms at five thousand,
+about 300 ms at twenty thousand. It is the right store for a personal
+or team corpus; past roughly twenty thousand chunks, move to Qdrant or
+pgvector. `atrium doctor` says so when the corpus gets there.
 
 The embedding provider is configured the same way whatever the store:
 any server that speaks the OpenAI `/v1/embeddings` API (Ollama, OpenAI,

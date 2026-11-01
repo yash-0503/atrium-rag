@@ -75,6 +75,17 @@ class JobStore:
             self.db_path, check_same_thread=False, isolation_level=None,
         )
         self._conn.row_factory = sqlite3.Row
+        # WAL lets a reader and a writer work at the same time, and the
+        # busy timeout makes a contended write *wait* instead of raising
+        # "database is locked" — which used to kill the worker outright.
+        try:
+            self._conn.execute("PRAGMA journal_mode=WAL")
+            self._conn.execute("PRAGMA busy_timeout=10000")
+            self._conn.execute("PRAGMA synchronous=NORMAL")
+        except sqlite3.Error:
+            # A file system without WAL is not a reason to refuse to
+            # run; the busy timeout alone still helps.
+            pass
         self._conn.execute(
             """
             CREATE TABLE IF NOT EXISTS jobs (
@@ -87,7 +98,9 @@ class JobStore:
                 updated_at    REAL NOT NULL,
                 payload       TEXT,
                 claimed_by    TEXT,
-                claimed_at    REAL
+                claimed_at    REAL,
+                attempts     INTEGER DEFAULT 0,
+                ocr_failures INTEGER DEFAULT 0
             )
             """
         )
@@ -116,6 +129,8 @@ class JobStore:
             ("payload", "TEXT"),
             ("claimed_by", "TEXT"),
             ("claimed_at", "REAL"),
+            ("attempts", "INTEGER"),
+            ("ocr_failures", "INTEGER"),
         ):
             if column not in existing:
                 self._conn.execute(f"ALTER TABLE jobs ADD COLUMN {column} {decl}")
@@ -177,7 +192,8 @@ class JobStore:
                 now = time.time()
                 self._conn.execute(
                     "UPDATE jobs SET status = ?, claimed_by = ?, claimed_at = ?, "
-                    "updated_at = ? WHERE job_id = ?",
+                    "updated_at = ?, attempts = COALESCE(attempts, 0) + 1 "
+                    "WHERE job_id = ?",
                     (STATUS_RUNNING, worker_id, now, now, row["job_id"]),
                 )
                 self._conn.execute("COMMIT")
@@ -192,14 +208,20 @@ class JobStore:
         job["status"] = STATUS_RUNNING
         job["claimed_by"] = worker_id
         job["claimed_at"] = now
+        job["attempts"] = int(row["attempts"] or 0) + 1
         return job
 
-    def release_stale_claims(self, stale_seconds: float) -> int:
+    def release_stale_claims(self, stale_seconds: float, max_attempts: int = 0) -> int:
         """Return jobs whose worker died mid-flight to the queue.
 
         A job is stale when it has been ``running`` for longer than
         ``stale_seconds``. The row goes back to ``pending`` so another
         worker picks it up; the claim fields are cleared.
+
+        A job that has already been attempted ``max_attempts`` times is
+        not released again: it is failed. Without that, a document that
+        hangs the parser is retried every ``stale_seconds`` for ever,
+        by every worker, and never leaves the queue.
 
         Returns the number of jobs released.
         """
@@ -207,11 +229,47 @@ class JobStore:
             return 0
         cutoff = time.time() - stale_seconds
         with self._lock:
+            if max_attempts:
+                # The ones that have burned their attempts are done.
+                self._conn.execute(
+                    "UPDATE jobs SET status = ?, claimed_by = NULL, claimed_at = NULL, "
+                    "updated_at = ?, error = ? WHERE status = ? "
+                    "AND claimed_at IS NOT NULL AND claimed_at < ? "
+                    "AND COALESCE(attempts, 0) >= ?",
+                    (
+                        STATUS_FAILED,
+                        time.time(),
+                        f"gave up after {max_attempts} attempts",
+                        STATUS_RUNNING,
+                        cutoff,
+                        max_attempts,
+                    ),
+                )
             cur = self._conn.execute(
                 "UPDATE jobs SET status = ?, claimed_by = NULL, claimed_at = NULL, "
                 "updated_at = ? WHERE status = ? AND claimed_at IS NOT NULL "
-                "AND claimed_at < ?",
-                (STATUS_PENDING, time.time(), STATUS_RUNNING, cutoff),
+                "AND claimed_at < ?"
+                + (" AND COALESCE(attempts, 0) < ?" if max_attempts else ""),
+                (STATUS_PENDING, time.time(), STATUS_RUNNING, cutoff)
+                + ((max_attempts,) if max_attempts else ()),
+            )
+            return cur.rowcount if cur.rowcount and cur.rowcount > 0 else 0
+
+    def purge_terminal_jobs(self, older_than_seconds: float) -> int:
+        """Delete finished jobs older than the retention window.
+
+        The job rows are the record of what happened; the payloads in
+        them are the user's documents. Those do not need to live
+        forever, and a queue that only grows is a queue that eventually
+        fills the disk.
+        """
+        if older_than_seconds <= 0:
+            return 0
+        cutoff = time.time() - older_than_seconds
+        with self._lock:
+            cur = self._conn.execute(
+                "DELETE FROM jobs WHERE status IN (?, ?) AND updated_at < ?",
+                (STATUS_COMPLETE, STATUS_FAILED, cutoff),
             )
             return cur.rowcount if cur.rowcount and cur.rowcount > 0 else 0
 
@@ -232,6 +290,15 @@ class JobStore:
                 f"UPDATE jobs SET {set_clause}, updated_at = ? WHERE job_id = ?",
                 params,
             )
+            # A finished job keeps its record and loses its document. The
+            # payload is the uploaded file, base64-encoded; keeping it
+            # meant the job store grew by the size of every document
+            # ever queued, forever, and every user's document stayed on
+            # disk after the ingest was long done.
+            if fields.get("status") in (STATUS_COMPLETE, STATUS_FAILED):
+                self._conn.execute(
+                    "UPDATE jobs SET payload = NULL WHERE job_id = ?", (job_id,)
+                )
 
     def get(self, job_id: str) -> Optional[dict]:
         with self._lock:
@@ -261,6 +328,10 @@ class JobStore:
             "created_at": row["created_at"],
             "updated_at": row["updated_at"],
             "claimed_by": row["claimed_by"] if "claimed_by" in row.keys() else None,
+            "attempts": (row["attempts"] if "attempts" in row.keys() else 0) or 0,
+            "ocr_failures": (
+                row["ocr_failures"] if "ocr_failures" in row.keys() else 0
+            ) or 0,
         }
 
     def close(self) -> None:

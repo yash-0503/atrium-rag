@@ -57,6 +57,7 @@ import io
 import json
 import logging
 import re
+import threading
 from collections import Counter, defaultdict
 from dataclasses import dataclass, field
 from typing import Optional, Protocol
@@ -238,16 +239,30 @@ class UniversalParser:
         self.max_vision_calls_per_doc = max_vision_calls_per_doc
         self.vision_concurrency = vision_concurrency
         self._docx_page_by_heading = docx_page_by_heading
-        self._vision_calls_queued = 0
+        # Per-parse state is per-thread. The parser is a singleton shared
+        # by every request, and `/ingest` runs up to INGEST_CONCURRENCY
+        # parses at once — so a shared "calls queued" counter and a
+        # shared "pending" list meant one document's vision budget was
+        # spent by another, and one thread's reset threw away another
+        # thread's queued captions.
+        self._local = threading.local()
+        # The caption cache is shared on purpose: it is keyed by the
+        # image digest, so a hit is always the right caption, and two
+        # documents with the same logo should only pay for it once.
         self._vision_cache: dict[str, str] = {}   # sha256(downscaled bytes) -> caption
-        self._pending_vision: list[tuple] = []     # (element, bytes, mimetype, context, digest)
 
     # -- public entrypoint ------------------------------------------------
 
     def parse(self, file_bytes: bytes, filename: str, mime_type: str) -> list[ParsedElement]:
-        self._vision_calls_queued = 0
-        self._vision_cache.clear()
-        self._pending_vision = []
+        state = self._parse_state()
+        state["calls"] = 0
+        state["pending"] = []
+        # The OCR adapter counts the pages it could not read; the count
+        # is read by the ingest so a document with unreadable pages is
+        # not reported as a clean success.
+        ocr = getattr(self, "ocr", None)
+        if ocr is not None and hasattr(ocr, "reset_failures"):
+            ocr.reset_failures()
 
         if mime_type == "application/pdf":
             elements = self._safe_parse("PDF", self._parse_pdf, file_bytes)
@@ -304,6 +319,26 @@ class UniversalParser:
 
         self._resolve_pending_vision()
         return elements
+
+    def _parse_state(self) -> dict:
+        """This thread's parse state.
+
+        The parser instance is shared; the state of a parse is not.
+        """
+        state = getattr(self._local, "state", None)
+        if state is None:
+            state = {"calls": 0, "pending": []}
+            self._local.state = state
+        return state
+
+    @property
+    def last_parse_ocr_failures(self) -> int:
+        """How many pages the OCR engine could not read in the last parse."""
+        ocr = getattr(self, "ocr", None)
+        if ocr is None:
+            return 0
+        return int(getattr(ocr, "failures", 0) or 0)
+
 
     def _safe_parse(self, label: str, fn, *args) -> list[ParsedElement]:
         """Run a per-format parser.
@@ -1054,16 +1089,18 @@ class UniversalParser:
         downscaled_bytes, downscaled_mime = self._downscale_for_vision(image_bytes)
         digest = hashlib.sha256(downscaled_bytes).hexdigest()
 
-        if digest in self._vision_cache:
-            element.text = self._vision_cache[digest]
+        cache = self._vision_cache
+        if digest in cache:
+            element.text = cache[digest]
             return
+        state = self._parse_state()
         if (self.max_vision_calls_per_doc is not None
-                and self._vision_calls_queued >= self.max_vision_calls_per_doc):
+                and state["calls"] >= self.max_vision_calls_per_doc):
             element.text = "[Image \u2014 vision call budget exhausted for this document]"
             return
 
-        self._vision_calls_queued += 1
-        self._pending_vision.append(
+        state["calls"] += 1
+        state["pending"].append(
             (element, downscaled_bytes, downscaled_mime, context, digest, truncate_summary, max_tokens)
         )
 
@@ -1071,7 +1108,8 @@ class UniversalParser:
         """Runs all queued vision calls concurrently (bounded thread pool)
         instead of blocking the page loop on each one serially — the main
         fix for slow/crashing runs on image-heavy documents."""
-        if not self._pending_vision:
+        pending = self._parse_state()["pending"]
+        if not pending:
             return
 
         def _call(item):
@@ -1095,11 +1133,11 @@ class UniversalParser:
             return element, digest, caption
 
         with concurrent.futures.ThreadPoolExecutor(max_workers=self.vision_concurrency) as pool:
-            for element, digest, caption in pool.map(_call, self._pending_vision):
+            for element, digest, caption in pool.map(_call, pending):
                 element.text = caption
                 self._vision_cache[digest] = caption
 
-        self._pending_vision = []
+        self._parse_state()["pending"] = []
 
     @staticmethod
     def _truncate_caption(text: str, max_sentences: int = CAPTION_MAX_SENTENCES) -> str:

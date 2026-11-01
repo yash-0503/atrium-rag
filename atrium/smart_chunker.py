@@ -197,6 +197,80 @@ class ChunkConfig:
     # makes a config self-describing when it's logged or serialized.
     mode: str = "auto"
 
+    # -- validation -----------------------------------------------------
+    #
+    # The parameters are the difference between a useful chunk and a
+    # corpus of nothing. `target_chars=0` raised a bare `range() arg 3
+    # must not be zero` from deep inside a chunker; `target_chars=-5`
+    # produced *zero chunks* and the document was reported as
+    # successfully ingested; `target_chars=10**9` put the whole
+    # document in one chunk and made retrieval useless. All three were
+    # accepted, because the values were never checked.
+
+    #: The largest a chunk may be. A target above this is a mistake,
+    #: not a request: it means one enormous chunk.
+    MAX_TARGET_CHARS = 100_000
+
+    def __post_init__(self) -> None:
+        _validate_chunk_parameters(self)
+
+
+def _validate_chunk_parameters(cfg) -> None:
+    """Check the chunking parameters, and say which one is wrong.
+
+    Called from `ChunkConfig.__post_init__`, so it covers both a
+    config built by hand and one resolved from a request's
+    `chunking_config` override — the resolver goes through
+    `dataclasses.replace`, which runs the same check.
+    """
+    def _int(name: str, value) -> int:
+        if isinstance(value, bool) or not isinstance(value, int):
+            raise ValueError(
+                f"{name} must be an integer, got {type(value).__name__}"
+            )
+        return value
+
+    target = _int("target_chars", cfg.target_chars)
+    overlap = _int("overlap_chars", cfg.overlap_chars)
+    minimum = _int("min_chunk_chars", cfg.min_chunk_chars)
+    parent_target = _int("parent_target_chars", cfg.parent_target_chars)
+    parent_overlap = _int("parent_overlap_chars", cfg.parent_overlap_chars)
+
+    if target < 1:
+        raise ValueError(f"target_chars must be at least 1, got {target}")
+    if target > ChunkConfig.MAX_TARGET_CHARS:
+        raise ValueError(
+            f"target_chars must be at most {ChunkConfig.MAX_TARGET_CHARS}, got {target}"
+        )
+    if overlap < 0:
+        raise ValueError(f"overlap_chars must be at least 0, got {overlap}")
+    if overlap >= target:
+        raise ValueError(
+            f"overlap_chars ({overlap}) must be smaller than "
+            f"target_chars ({target})"
+        )
+    if minimum < 0:
+        raise ValueError(f"min_chunk_chars must be at least 0, got {minimum}")
+    if minimum > target:
+        raise ValueError(
+            f"min_chunk_chars ({minimum}) must not be larger than "
+            f"target_chars ({target})"
+        )
+    if parent_target < target:
+        raise ValueError(
+            f"parent_target_chars ({parent_target}) must not be smaller than "
+            f"target_chars ({target})"
+        )
+    if parent_overlap < 0:
+        raise ValueError(
+            f"parent_overlap_chars must be at least 0, got {parent_overlap}"
+        )
+    if parent_overlap >= parent_target:
+        raise ValueError(
+            f"parent_overlap_chars ({parent_overlap}) must be smaller than "
+            f"parent_target_chars ({parent_target})"
+        )
+
 
 # Public preset table. Keys are the preset names; values
 # are the ChunkConfig instances used by `chunk_with_mode` when the

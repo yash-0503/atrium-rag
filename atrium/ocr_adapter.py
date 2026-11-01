@@ -42,6 +42,32 @@ __all__ = ["TesseractOCRAdapter", "RapidOCRAdapter", "build_ocr_adapter"]
 
 
 class TesseractOCRAdapter:
+    # -- failure accounting ------------------------------------------------
+    #
+    # An OCR failure used to be invisible: the adapter returned an empty
+    # string, the page contributed no text, and the document was
+    # reported as ingested. The count is what lets the ingest say so.
+
+    @property
+    def failures(self) -> int:
+        """How many pages did not come back."""
+        return getattr(self, "_failures", 0)
+
+    @property
+    def last_error(self) -> str:
+        """Why the last page did not come back."""
+        return getattr(self, "_last_error", "")
+
+    def _record_failure(self, reason: str) -> None:
+        self._failures = getattr(self, "_failures", 0) + 1
+        self._last_error = reason
+
+    def reset_failures(self) -> None:
+        """Start counting again — called at the start of each document."""
+        self._failures = 0
+        self._last_error = ""
+
+
     """Synchronous single-image text extraction via Tesseract. Use this
     when the vision adapter isn't configured (no Ollama vision model,
     no hosted API) and you still want scanned content indexed as text.
@@ -92,16 +118,28 @@ class TesseractOCRAdapter:
         (possibly empty) so a problematic image becomes an empty caption
         chunk rather than a crashed job. OCR is synchronous by design:
         pages are processed sequentially, a single page at 150 dpi is
-        sub-second, and queueing adds no value here."""
+        sub-second, and queueing adds no value here.
+
+        A failure is counted, not swallowed: `self.failures` says how
+        many pages did not come back, and `self.last_error` says why.
+        Before this, an OCR failure was a log line and an empty page,
+        and the document was reported as ingested — which is how a
+        scanned PDF ends up in the corpus with no text in it and
+        nothing in the job row to say so.
+        """
         try:
             import pytesseract
             from PIL import Image
 
             img = Image.open(io.BytesIO(image_bytes))
-            return pytesseract.image_to_string(
+            text = pytesseract.image_to_string(
                 img, lang=lang or self.lang, timeout=self.timeout,
             ).strip()
+            if not text:
+                self._record_failure("the page came back empty")
+            return text
         except Exception as exc:
+            self._record_failure(f"{type(exc).__name__}: {exc}")
             log.warning("OCR transcription failed (%s: %s)", type(exc).__name__, exc)
             return ""
 
@@ -115,6 +153,32 @@ class TesseractOCRAdapter:
 
 
 class RapidOCRAdapter:
+    # -- failure accounting ------------------------------------------------
+    #
+    # An OCR failure used to be invisible: the adapter returned an empty
+    # string, the page contributed no text, and the document was
+    # reported as ingested. The count is what lets the ingest say so.
+
+    @property
+    def failures(self) -> int:
+        """How many pages did not come back."""
+        return getattr(self, "_failures", 0)
+
+    @property
+    def last_error(self) -> str:
+        """Why the last page did not come back."""
+        return getattr(self, "_last_error", "")
+
+    def _record_failure(self, reason: str) -> None:
+        self._failures = getattr(self, "_failures", 0) + 1
+        self._last_error = reason
+
+    def reset_failures(self) -> None:
+        """Start counting again — called at the start of each document."""
+        self._failures = 0
+        self._last_error = ""
+
+
     """PP-OCRv4 via ONNX Runtime. No system binary, no model download.
 
     The models ship inside the `rapidocr-onnxruntime` wheel, so the
@@ -188,9 +252,11 @@ class RapidOCRAdapter:
         try:
             result, _elapse = self._engine(image_bytes)
         except Exception as exc:
+            self._record_failure(f"{type(exc).__name__}: {exc}")
             log.warning("RapidOCR transcription failed (%s: %s)", type(exc).__name__, exc)
             return ""
         if not result:
+            self._record_failure("the page came back empty")
             return ""
         lines = []
         for item in result:

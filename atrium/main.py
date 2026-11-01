@@ -16,7 +16,7 @@ from pydantic import BaseModel, Field
 
 # Import the existing embedder and DB adapters
 from atrium.adapters import build_store
-from atrium.config import env_bool, env_float, env_int, env_str
+from atrium.config import data_path, env_bool, env_float, env_int, env_str
 from atrium.embedder_config import build_embedder, default_base_url
 from atrium.errors import AtriumSetupError
 from atrium.job_store import JobStore
@@ -26,6 +26,7 @@ from atrium.security import (
     check_mime,
     check_payload_size,
     log_redacted_traceback,
+    max_upload_bytes,
     redacted_traceback,
     require_api_key_if_configured,
 )
@@ -328,6 +329,12 @@ async def lifespan(app: FastAPI):
                 "run `atrium init` to point at a reachable one.",
                 detail,
             )
+    log.info(
+        "job store: %s", data_path("JOB_DB_PATH", "jobs.db"),
+    )
+    log.info(
+        "vector store: %s (%s)", DB_TYPE, data_path("LOCAL_DB_PATH", "atrium_local.db"),
+    )
     try:
         _get_db().ensure_collection("documents", embedder.dimension)
         log.info(
@@ -655,7 +662,19 @@ async def _run_one_ingestion(
         # A dependency that is missing, a document that will not parse,
         # or anything else — each with the status that says which.
         raise _ingest_failure(exc) from exc
-    return {"job_id": job_id, "doc_id": final_doc_id, "filename": filename}
+    record = job_store.get(job_id) or {}
+    return {
+        "job_id": job_id,
+        "doc_id": final_doc_id,
+        "filename": filename,
+        # Pages the OCR engine could not read. Present only when there
+        # were some, so the response shape is unchanged otherwise.
+        **(
+            {"ocr_failures": record["ocr_failures"]}
+            if record.get("ocr_failures")
+            else {}
+        ),
+    }
 
 
 @app.post("/ingest")
@@ -703,19 +722,54 @@ async def ingest(
     if len(requested_doc_ids) < len(files):
         requested_doc_ids.extend([None] * (len(files) - len(requested_doc_ids)))
 
-    payloads = [(await f.read(), _upload_filename(f)) for f in files]
+    # How many files one request may carry. Each file is read into
+    # memory while it is ingested, so this is what bounds a request's
+    # footprint.
+    max_files = env_int("MAX_FILES_PER_REQUEST")
+    if max_files and len(files) > max_files:
+        raise HTTPException(
+            422,
+            f"this request carries {len(files)} files; the limit is "
+            f"{max_files} (MAX_FILES_PER_REQUEST)",
+        )
+
+    # The size of each file is known from the multipart headers, so an
+    # oversize file is rejected before its bytes are read into memory.
+    limit = max_upload_bytes()
+    for upload in files:
+        size = getattr(upload, "size", None)
+        if size is not None and limit and size > limit:
+            raise HTTPException(
+                413,
+                f"upload exceeds MAX_UPLOAD_BYTES={limit} "
+                f"(file {upload.filename!r} is {size} bytes)",
+            )
+
+    # Each file is read inside its own ingest, under the concurrency
+    # semaphore. Reading them all up front meant the request held every
+    # file in memory at once, so the memory a request needed grew with
+    # the number of files in it rather than with the concurrency limit.
+    async def ingest_one(upload, wanted_doc_id):
+        raw = await upload.read()
+        return await _run_one_ingestion(
+            raw, _upload_filename(upload), wanted_doc_id, mode, config,
+        )
+
     # `return_exceptions=True` because one bad file must not discard the
     # other files' results — their work has already happened, and the
     # client needs to know which of them landed.
     settled = await asyncio.gather(
-        *[_run_one_ingestion(raw, name, did, mode, config)
-          for (raw, name), did in zip(payloads, requested_doc_ids)],
+        *[
+            ingest_one(upload, wanted)
+            for upload, wanted in zip(files, requested_doc_ids)
+        ],
         return_exceptions=True,
     )
 
     results: List[dict] = []
     failures: List[HTTPException] = []
-    for (_raw, name), outcome in zip(payloads, settled):
+    for upload, outcome in zip(files, settled):
+        name = _upload_filename(upload)
         if isinstance(outcome, BaseException):
             failure = (
                 outcome
@@ -755,6 +809,13 @@ async def ingest_single(
     file; preserved so existing SDK calls don't break."""
     check_content_length(request.headers.get("content-length"))
     mode, config = _parse_chunking_overrides(chunking_mode, chunking_config)
+    limit = max_upload_bytes()
+    size = getattr(file, "size", None)
+    if size is not None and limit and size > limit:
+        raise HTTPException(
+            413,
+            f"upload exceeds MAX_UPLOAD_BYTES={limit} (file is {size} bytes)",
+        )
     file_bytes = await file.read()
     return await _run_one_ingestion(file_bytes, _upload_filename(file), doc_id, mode, config)
 

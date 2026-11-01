@@ -851,6 +851,30 @@ def doctor(
                         "start a new one (`atrium init`) and re-ingest[/]"
                     )
 
+    # The local store scans every stored vector on every query, so its
+    # cost grows with the corpus. Say so before the corpus gets big
+    # enough for it to be felt.
+    try:
+        from atrium.adapters import build_store
+        from atrium.config import env_str
+        from atrium.local_store import SqliteAdapter
+
+        if (env_str("VECTOR_DB") or "sqlite").lower() in ("sqlite", "local", "file"):
+            store = build_store()
+            if isinstance(store, SqliteAdapter):
+                count = store.chunk_count()
+                limit = SqliteAdapter.RECOMMENDED_MAX_CHUNKS
+                if count > limit:
+                    console.print()
+                    console.print(
+                        f"[warn]The local store holds {count} chunks. Its "
+                        f"search scans all of them, so it gets slow past "
+                        f"about {limit}. Switch to Qdrant or pgvector for a "
+                        f"corpus this size.[/]"
+                    )
+    except Exception as exc:
+        console.print(f"  [warn]could not size the local store: {exc}[/]")
+
     # Security posture notes — flag a permissive config before the
     # operator ships it. Warnings, not failures.
     try:
@@ -1351,24 +1375,46 @@ def demo(
     console.print(table)
 
 
+
+def _is_loopback(host: str) -> bool:
+    """Is this address only reachable from this machine?"""
+    return host in ("127.0.0.1", "::1", "localhost", "")
+
+
 @app.command()
 def serve(
-    host: str = typer.Option("0.0.0.0", "--host", help="Bind host"),
+    host: Optional[str] = typer.Option(
+        None,
+        "--host",
+        help="Bind address. Defaults to ATRIUM_BIND, which is 127.0.0.1 — "
+             "pass 0.0.0.0 to serve beyond this machine on purpose.",
+    ),
     port: int = typer.Option(8000, "--port", help="Bind port"),
     reload: bool = typer.Option(False, "--reload", help="Enable auto-reload (dev only)"),
 ) -> None:
     """Run the FastAPI server with uvicorn. Reads .env from the cwd."""
-    _brand(f"serving on {host}:{port}")
     import uvicorn
 
     from atrium.config import env_str
+
+    # Loopback unless the operator says otherwise. A fresh install used
+    # to bind 0.0.0.0 with no API key, which put an open ingest
+    # endpoint on the network for anyone who ran one command.
+    bind = host or env_str("ATRIUM_BIND") or "127.0.0.1"
+    _brand(f"serving on {bind}:{port}")
+
+    if not _is_loopback(bind) and not env_str("API_KEY"):
+        console.print(
+            f"[warn]The API is bound to {bind} with no API key — every "
+            "endpoint, including /ingest, is open to the network.[/]",
+        )
 
     # `atrium` loads `.env` into the environment at import time, so
     # there is nothing to copy here — the FastAPI service sees exactly
     # the same values the CLI does.
     uvicorn.run(
         "atrium.main:app",
-        host=host,
+        host=bind,
         port=port,
         reload=reload,
         log_level=env_str("LOG_LEVEL").lower(),
