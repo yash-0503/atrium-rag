@@ -28,9 +28,11 @@ list items intact and carries the heading path into the embedding
 text, so a chunk retrieved from the middle of a section still knows
 where it came from.
 
-Retrieval fuses two rankings with Reciprocal Rank Fusion: dense
-similarity over the embeddings, and BM25 over the same tokens. Both
-are always computed, and the fused ranking is what gets returned.
+Retrieval is dense similarity over the embeddings, with an optional
+cross-encoder rerank stage. The library also carries a BM25 ranker and
+a confidence gate that fuses the two with Reciprocal Rank Fusion — but
+no endpoint or command passes it a sparse index, so from the product's
+point of view it does not exist yet.
 
 ---
 

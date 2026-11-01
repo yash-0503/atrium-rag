@@ -1,0 +1,6 @@
+{
+  "name": "26_gov_docx",
+  "mime": "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+  "origin": "The synthetic 10_gov_docx document from the evaluation corpus (CC0-1.0, generated for this project). It is the document the website's chunk-packing diagram shows, and `scripts/dump_chunk_packing.py` regenerates that diagram from it.",
+  "note": "Identical to tests/benchmarks/fixtures/10_gov_docx/source.docx in the evaluation corpus."
+}

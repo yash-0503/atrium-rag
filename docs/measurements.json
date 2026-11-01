@@ -1,0 +1,23 @@
+{
+  "documents": 19,
+  "chunks": 1451,
+  "ingest_seconds": 96.3,
+  "peak_mb": 425,
+  "resident_after_ingest_mb": 425,
+  "search_p50_ms": 28,
+  "search_p95_ms": 38,
+  "search_end_to_end_p50_ms": 69,
+  "search_end_to_end_p95_ms": 80,
+  "queries": 50,
+  "embedder": "OpenAICompatibleEmbedder",
+  "embedder_dim": 1024,
+  "backend": "http://localhost:11434/v1",
+  "store": "sqlite",
+  "machine": "Apple M4",
+  "python": "3.12.13",
+  "resident_mb": 88,
+  "serving_search_p50_ms": 27,
+  "serving_search_p95_ms": 36,
+  "serving_end_to_end_p50_ms": 68,
+  "serving_end_to_end_p95_ms": 77
+}

@@ -208,8 +208,7 @@ class SqliteAdapter:
         score_threshold: Optional[float],
         children_only: bool,
     ) -> List[Dict[str, Any]]:
-        import math
-        import struct
+        import numpy as np
 
         conn = self._connect()
         rows = conn.execute(
@@ -218,22 +217,36 @@ class SqliteAdapter:
         if not rows:
             return []
 
-        query = [float(v) for v in query_vector]
-        query_norm = math.sqrt(sum(v * v for v in query)) or 1.0
+        query = np.asarray(query_vector, dtype=np.float32)
+        if query.ndim != 1 or query.size == 0:
+            return []
+
+        # The vectors are stored as raw float32, so the whole corpus is
+        # one buffer and the cosine is one matrix product. Doing this
+        # in Python — unpacking and multiplying row by row — costs
+        # 160 ms on a thousand chunks, which is the difference between
+        # a search that feels instant and one that does not.
+        keep = [
+            index
+            for index, row in enumerate(rows)
+            if int(row["dim"] or 0) == query.size
+        ]
+        if not keep:
+            return []
+        buffer = b"".join(rows[index]["vector"] for index in keep)
+        matrix = np.frombuffer(buffer, dtype=np.float32).reshape(len(keep), query.size)
+        norms = np.linalg.norm(matrix, axis=1, keepdims=True)
+        norms[norms == 0] = 1.0
+        query_norm = float(np.linalg.norm(query)) or 1.0
+        scores = (matrix @ query).ravel() / (norms.ravel() * query_norm)
 
         scored: List[Dict[str, Any]] = []
-        for row in rows:
+        for position, index in enumerate(keep):
+            row = rows[index]
             payload = json.loads(row["payload"] or "{}")
             if children_only and bool(payload.get("is_parent", False)):
                 continue
-            dim = int(row["dim"] or 0)
-            if dim != len(query):
-                # A chunk stored at a different dimension cannot be
-                # compared. Skipping it beats a crash.
-                continue
-            vector = struct.unpack(f"{dim}f", row["vector"])
-            norm = math.sqrt(sum(v * v for v in vector)) or 1.0
-            score = sum(a * b for a, b in zip(query, vector)) / (query_norm * norm)
+            score = float(scores[position])
             if score_threshold is not None and score < float(score_threshold):
                 continue
             scored.append({

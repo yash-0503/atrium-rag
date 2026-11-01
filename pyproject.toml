@@ -13,7 +13,7 @@ build-backend = "setuptools.build_meta"
 # says what the thing does. If you fork this, pick your own name —
 # the import path and CLI name are independent of it.
 name = "atrium-rag"
-version = "0.2.0"
+version = "0.1.0"
 description = "Atrium — universal RAG ingestion: parse, chunk, embed, and retrieve across PDF, Office, HTML, and Markdown. The gathering hall for your documents."
 readme = "README.md"
 requires-python = ">=3.10"

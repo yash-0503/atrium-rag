@@ -24,7 +24,7 @@ pyproject.toml and exposed here for runtime introspection.
 
 from __future__ import annotations
 
-__version__ = "0.2.0"
+__version__ = "0.1.0"
 
 # Load `.env` into the process environment exactly once, here — before
 # any submodule reads a setting. This is the fix for a real hole:
