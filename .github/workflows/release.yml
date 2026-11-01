@@ -33,7 +33,7 @@ jobs:
     permissions:
       contents: write  # for the GitHub release step
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
         with:
           ref: ${{ github.event.inputs.tag || github.ref }}
 
