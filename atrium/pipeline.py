@@ -1,3 +1,4 @@
+import threading
 import uuid
 from dataclasses import dataclass
 from typing import List, Optional
@@ -11,6 +12,31 @@ from atrium.models import ChunkRecord, SourceMetadata
 # future preset/strategy changes propagate without a pipeline edit.
 from atrium.smart_chunker import chunk_with_mode
 from atrium.universal_parser import UniversalParser
+
+# ---------------------------------------------------------------------------
+# Per-document locking
+# ---------------------------------------------------------------------------
+#
+# Two ingests of the same document at the same time interleave: one
+# writes its chunks, the other deletes them as "stale", and the corpus
+# ends up holding a mix of two versions that belongs to neither.
+#
+# The lock is per document, so unrelated documents still ingest in
+# parallel, and it is per process, so the API and the worker each
+# serialise their own ingests. Across processes the deterministic
+# chunk ids are what make a repeated ingest idempotent.
+_DOC_LOCKS: dict = {}
+_DOC_LOCKS_GUARD = threading.Lock()
+
+
+def doc_lock(doc_id: str):
+    """A lock for one document's ingest."""
+    with _DOC_LOCKS_GUARD:
+        lock = _DOC_LOCKS.get(doc_id)
+        if lock is None:
+            lock = threading.Lock()
+            _DOC_LOCKS[doc_id] = lock
+    return lock
 
 
 def _build_chunk_record(
@@ -138,10 +164,16 @@ def ingest_document(
         for c, emb in zip(batch, embeddings):
             c.embedding = emb
 
-    db.upsert(chunks)
-
-    # 5. Versioned Upsert: Delete stale chunks from previous runs.
-    db.delete_stale_chunks(doc_id, ingest_run_id)
+    # 5. Write this version and remove the previous one, as one
+    #    operation, under a lock on this document.
+    #
+    #    `replace_chunks` is atomic where the store can be (SQLite runs
+    #    both statements in one transaction; Postgres likewise), and is
+    #    ordered delete-then-write where it cannot be, so a crash
+    #    leaves the document absent — recoverable by re-ingesting —
+    #    rather than present twice, which is not.
+    with doc_lock(doc_id):
+        db.replace_chunks(doc_id, chunks, ingest_run_id)
 
     return IngestResult(
         doc_id=doc_id,
@@ -175,3 +207,10 @@ def run_ingestion(job_id: str, doc_id: str, file_bytes: bytes, filename: str, mi
         )
     except Exception as e:
         job_store.update(job_id, status="failed", error=str(e))
+        # The failure is recorded on the job row *and* raised. Swallowing
+        # it here meant the worker logged "complete" for a job that had
+        # failed, and the HTTP path answered 200 for a document that was
+        # never indexed. The row keeps the detail for anyone polling
+        # GET /jobs/{id}; the exception carries the type, which is what
+        # the HTTP layer maps to a status.
+        raise

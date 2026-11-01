@@ -173,6 +173,58 @@ class SqliteAdapter:
             )
             conn.commit()
 
+    def replace_chunks(
+        self,
+        doc_id: str,
+        chunks: Sequence[Any],
+        current_run_id: str,
+        batch_size: int = 100,
+    ) -> None:
+        """Write this version of the document, removing the previous one.
+
+        Both statements run in one SQLite transaction, so the document
+        is either the old version or the new one. Never a mix, and
+        never two copies — which is what a crash between a separate
+        upsert and a separate delete would leave behind.
+        """
+        import struct
+
+        conn = self._connect()
+        rows = []
+        for chunk in chunks:
+            vector = list(getattr(chunk, "embedding", None) or [])
+            if not vector:
+                continue
+            payload = chunk.model_dump(exclude={"embedding"})
+            rows.append((
+                chunk.chunk_id,
+                chunk.doc_id,
+                getattr(chunk, "ingest_run_id", "") or "",
+                chunk.text,
+                len(vector),
+                struct.pack(f"{len(vector)}f", *vector),
+                json.dumps(payload, ensure_ascii=False, default=str),
+            ))
+
+        with self._lock:
+            conn.execute("BEGIN IMMEDIATE")
+            try:
+                conn.execute(
+                    "DELETE FROM chunks WHERE doc_id = ? AND ingest_run_id != ?",
+                    (doc_id, current_run_id),
+                )
+                if rows:
+                    conn.executemany(
+                        "INSERT OR REPLACE INTO chunks"
+                        "(chunk_id, doc_id, ingest_run_id, text, dim, vector, payload)"
+                        " VALUES (?, ?, ?, ?, ?, ?, ?)",
+                        rows,
+                    )
+                conn.execute("COMMIT")
+            except Exception:
+                conn.execute("ROLLBACK")
+                raise
+
     # -- reading --------------------------------------------------------
 
     def health(self) -> bool:

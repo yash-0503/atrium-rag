@@ -110,6 +110,7 @@ def _register_vector_fn():
 
 # Protocols
 
+
 class VisionAdapter(Protocol):
     def describe_image(self, image_bytes: bytes, mime_type: str = "image/png") -> str: ...
     def health(self) -> bool: ...
@@ -124,6 +125,13 @@ class VectorDBAdapter(Protocol):
     def ensure_collection(self, name: str, dim: int) -> None: ...
     def upsert(self, chunks: List[ChunkRecord], batch_size: int = 100) -> None: ...
     def delete_stale_chunks(self, doc_id: str, current_run_id: str) -> None: ...
+    def replace_chunks(
+        self,
+        doc_id: str,
+        chunks: List[ChunkRecord],
+        current_run_id: str,
+        batch_size: int = 100,
+    ) -> None: ...
     def health(self) -> bool: ...
     # Task B (2026-10-10): retrieval protocol shared by atrium.retrieval.
     # Adapters must implement all four for `retrieve_and_rerank` to
@@ -147,6 +155,46 @@ class VectorDBAdapter(Protocol):
     def retrieve_parents(
         self, parent_ids: List[str]
     ) -> Dict[str, Dict[str, Any]]: ...
+
+# ---------------------------------------------------------------------------
+# The store factory
+# ---------------------------------------------------------------------------
+#
+# One function decides which vector store the configuration names, and
+# every process that needs a store calls it. It used to be three
+# copies of the same if/elif — and they had drifted: the API knew
+# about the local SQLite store and the worker did not, so with the
+# default `VECTOR_DB=sqlite` the worker built a Postgres adapter and
+# the two halves of the system wrote to different databases.
+#
+# The supported values are the same everywhere, the resolution is the
+# same everywhere, and an unknown value fails the same way everywhere.
+
+
+def build_store(kind: Optional[str] = None) -> VectorDBAdapter:
+    """The vector store the configuration names.
+
+    `kind` defaults to `VECTOR_DB`. Raises `ValueError` naming the
+    supported values for anything else, rather than silently falling
+    through to a default the operator did not ask for.
+    """
+    from atrium.config import env_int, env_str
+
+    name = (kind if kind is not None else env_str("VECTOR_DB") or "sqlite").strip().lower()
+    if name in ("sqlite", "local", "file"):
+        from atrium.local_store import SqliteAdapter
+
+        return SqliteAdapter(path=env_str("LOCAL_DB_PATH") or "atrium_local.db")
+    if name == "qdrant":
+        return QdrantAdapter(
+            host=env_str("QDRANT_HOST") or "localhost",
+            port=env_int("QDRANT_PORT") or 6333,
+        )
+    if name == "pgvector":
+        return PgVectorAdapter(conn_info=env_str("PG_CONN"))
+    raise ValueError(
+        f"unknown VECTOR_DB {name!r}; expected one of: sqlite, qdrant, pgvector"
+    )
 
 class OpenAICompatibleEmbedder:
     """Any server that speaks the OpenAI `/v1/embeddings` API.
@@ -321,6 +369,27 @@ class QdrantAdapter:
                 FieldCondition(key="ingest_run_id", match=MatchValue(value=current_run_id))
             ])
         )
+
+    def replace_chunks(
+        self,
+        doc_id: str,
+        chunks: List[ChunkRecord],
+        current_run_id: str,
+        batch_size: int = 100,
+    ) -> None:
+        """Write this version of the document, removing the previous one.
+
+        Delete first, then write. The order matters: Qdrant has no
+        transaction across two calls, and the two orders fail
+        differently. Writing first and deleting after leaves two
+        versions of the document if the process dies in between — the
+        corpus fills with near-duplicates and every search returns
+        both. Deleting first leaves the document *absent* if it dies,
+        which a re-ingest fixes. Absence is recoverable; duplication
+        is not.
+        """
+        self.delete_stale_chunks(doc_id, current_run_id)
+        self.upsert(chunks, batch_size=batch_size)
 
     def health(self) -> bool:
         try: return self.client.get_collections() is not None
@@ -507,6 +576,42 @@ class PgVectorAdapter:
     def delete_stale_chunks(self, doc_id: str, current_run_id: str) -> None:
         with self.pool.connection() as conn:
             conn.execute("DELETE FROM chunks WHERE doc_id = %s AND ingest_run_id != %s", (doc_id, current_run_id))
+
+    def replace_chunks(
+        self,
+        doc_id: str,
+        chunks: List[ChunkRecord],
+        current_run_id: str,
+        batch_size: int = 100,
+    ) -> None:
+        """Write this version of the document, removing the previous one.
+
+        Both statements run in one transaction, so the document is
+        either the old version or the new one — never a mix, and never
+        two copies.
+        """
+        with self.pool.connection() as conn:
+            _register_vector_fn()(conn)
+            with conn.transaction():
+                conn.execute(
+                    "DELETE FROM chunks WHERE doc_id = %s AND ingest_run_id != %s",
+                    (doc_id, current_run_id),
+                )
+                with conn.cursor() as cur:
+                    for chunk in chunks:
+                        cur.execute(
+                            "INSERT INTO chunks (chunk_id, doc_id, ingest_run_id, embedding, payload) "
+                            "VALUES (%s, %s, %s, %s, %s) "
+                            "ON CONFLICT (chunk_id) DO UPDATE SET "
+                            "embedding = EXCLUDED.embedding, payload = EXCLUDED.payload;",
+                            (
+                                chunk.chunk_id,
+                                chunk.doc_id,
+                                chunk.ingest_run_id,
+                                chunk.embedding,
+                                chunk.model_dump_json(exclude={"embedding"}),
+                            ),
+                        )
 
     def health(self) -> bool:
         with _quiet_pool_logs():

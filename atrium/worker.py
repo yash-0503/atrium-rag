@@ -19,7 +19,7 @@ import time
 import traceback
 import uuid
 
-from atrium.adapters import PgVectorAdapter, QdrantAdapter
+from atrium.adapters import build_store
 from atrium.config import env_bool, env_float, env_int, env_str
 from atrium.embedder_config import build_embedder, default_base_url
 from atrium.job_store import JobStore
@@ -113,13 +113,11 @@ def _build_embedder():
 
 
 def _build_db():
-    db_type = env_str("VECTOR_DB")
-    if db_type == "qdrant":
-        return QdrantAdapter(
-            host=env_str("QDRANT_HOST"),
-            port=env_int("QDRANT_PORT"),
-        )
-    return PgVectorAdapter(conn_info=env_str("PG_CONN"))
+    # The same factory the API uses. It used to be a copy that had
+    # drifted: with the default `VECTOR_DB=sqlite` this built a
+    # Postgres adapter while the API built a SQLite one, so the worker
+    # and the service wrote to different databases.
+    return build_store()
 
 
 def _build_job_store():

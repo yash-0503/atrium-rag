@@ -306,35 +306,28 @@ class UniversalParser:
         return elements
 
     def _safe_parse(self, label: str, fn, *args) -> list[ParsedElement]:
-        """Run a per-format parser with a graceful fallback: if anything
-        inside the parser raises unexpectedly, log the real exception
-        server-side and return a single placeholder paragraph so the
-        ingest still produces something instead of dying with a 500.
+        """Run a per-format parser.
 
-        Pre-declared user-actionable errors (ValueError for corrupt /
-        unsupported files, RuntimeError for missing optional libraries)
-        propagate so the message stays actionable — those are not 'the
-        parser tripped on something we should paper over', they are
-        'the user uploaded the wrong thing or needs to install a dep'.
+        A parse failure is a parse failure, and it propagates. The
+        ingest fails, the job row says so, and nothing is indexed.
 
-        A truly-empty result is logged but NOT replaced with a placeholder
-        — an empty CSV / HTML / PDF is a legitimate result for an
-        actually-empty file, and silently inventing a 'working on it'
-        chunk there would mislead retrieval downstream."""
+        This used to return a placeholder paragraph instead — "we're
+        working on full support for this file" — which meant a crashed
+        parser produced a real, embedded, retrievable chunk of
+        marketing text, and the job reported `complete`. A failure
+        reported as content is worse than a failure reported as a
+        failure: it fills the corpus with lies and tells the operator
+        everything worked.
+
+        A truly-empty result is logged and returned as-is. An empty
+        CSV / HTML / PDF is a legitimate result for an actually-empty
+        file, and inventing a chunk there would mislead retrieval
+        downstream just the same."""
         try:
             elements = fn(*args)
-        except (ValueError, RuntimeError):
+        except Exception:
+            log.exception("Parser %s crashed", label)
             raise
-        except Exception as exc:
-            log.exception("Parser %s crashed: %s", label, exc)
-            return [ParsedElement(
-                type="paragraph", page=1,
-                text=(
-                    f"[We're working on full support for this {label} file. "
-                    f"Basic extraction failed — for now, please convert to "
-                    f"PDF or TXT if you need this content indexed urgently.]"
-                ),
-            )]
         if not elements:
             log.warning("Parser %s returned 0 elements", label)
         return elements

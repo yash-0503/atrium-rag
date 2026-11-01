@@ -1107,6 +1107,44 @@ def _stamp_strategy(chunks: list, strategy: str) -> list:
     return chunks
 
 
+
+def _assign_deterministic_ids(chunks: list, doc_id: str, strategy: str) -> list:
+    """Give every chunk a content-addressed id.
+
+    A random id means that ingesting the same document twice leaves two
+    copies of every chunk in the store, and the corpus quietly fills
+    with near-duplicates. A deterministic id means the second ingest
+    *replaces* the chunk instead of adding one.
+
+    The id is derived from the document, the strategy, the chunk's
+    position, its content hash and its span. The position is part of it
+    on purpose: two identical elements at different positions are two
+    different chunks, and must not collapse into one.
+    """
+    if not chunks:
+        return chunks
+
+    mapping: dict = {}
+    for index, chunk in enumerate(chunks):
+        span = getattr(chunk, "char_span", (0, 0))
+        digest = uuid.uuid5(
+            uuid.NAMESPACE_URL,
+            f"atrium:{doc_id}:{strategy}:{index}:"
+            f"{getattr(chunk, 'content_hash', '')}:{span}",
+        )
+        mapping[chunk.chunk_id] = str(digest)
+
+    for chunk in chunks:
+        chunk.chunk_id = mapping.get(chunk.chunk_id, chunk.chunk_id)
+        parent_id = getattr(chunk, "parent_id", None)
+        if parent_id in mapping:
+            chunk.parent_id = mapping[parent_id]
+        child_ids = getattr(chunk, "child_ids", None)
+        if child_ids:
+            chunk.child_ids = [mapping.get(c, c) for c in child_ids]
+    return chunks
+
+
 def chunk_with_mode(elements, doc_id: str, file_name: str,
                     mode: str = "auto", config: Optional[dict] = None) -> list:
     """Mode-aware chunking entry point. The single dispatch the rest
@@ -1137,9 +1175,12 @@ def chunk_with_mode(elements, doc_id: str, file_name: str,
         # structure_aware so we don't crash on real input.
         log.warning("Unknown strategy %r, falling back to structure_aware", cfg.strategy)
         strategy_fn = _chunk_structure_aware
-    return _stamp_strategy(
+    chunks = _stamp_strategy(
         strategy_fn(elements, doc_id, file_name, cfg), cfg.strategy,
     )
+    # Content-addressed ids, so that ingesting the same document twice
+    # replaces its chunks instead of doubling them.
+    return _assign_deterministic_ids(chunks, doc_id, cfg.strategy)
 
 
 def chunk_default(elements, doc_id: str, file_name: str) -> list:

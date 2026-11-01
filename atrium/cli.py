@@ -958,7 +958,7 @@ def _build_runtime():
 
 def _build_runtime_inner():
     """The construction itself; `_build_runtime` handles the failures."""
-    from atrium.adapters import PgVectorAdapter, QdrantAdapter
+    from atrium.adapters import build_store
     from atrium.config import env_bool, env_float, env_str
     from atrium.embedder_config import build_embedder
     from atrium.errors import AtriumSetupError
@@ -993,18 +993,8 @@ def _build_runtime_inner():
 
     parser = UniversalParser(vision_adapter=vision, ocr_adapter=ocr)
 
-    backend = env_str("VECTOR_DB") or "sqlite"
-    if backend == "pgvector":
-        db = PgVectorAdapter(conn_info=env_str("PG_CONN"))
-    elif backend in ("sqlite", "local", "file"):
-        from atrium.local_store import SqliteAdapter
-
-        db = SqliteAdapter(path=env_str("LOCAL_DB_PATH") or "atrium_local.db")
-    else:
-        db = QdrantAdapter(
-            host=env_str("QDRANT_HOST"),
-            port=int(env_str("QDRANT_PORT")),
-        )
+    db = build_store()
+    backend = (env_str("VECTOR_DB") or "sqlite").strip().lower()
 
     # A store that is not there is a setup problem, and this is the
     # moment to say so — before a document has been parsed and embedded.

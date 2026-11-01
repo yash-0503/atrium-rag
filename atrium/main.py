@@ -15,7 +15,7 @@ from fastapi.responses import HTMLResponse, JSONResponse
 from pydantic import BaseModel, Field
 
 # Import the existing embedder and DB adapters
-from atrium.adapters import PgVectorAdapter, QdrantAdapter
+from atrium.adapters import build_store
 from atrium.config import env_bool, env_float, env_int, env_str
 from atrium.embedder_config import build_embedder, default_base_url
 from atrium.errors import AtriumSetupError
@@ -114,6 +114,30 @@ def _explain(exc: Exception) -> str:
     return str(exc)
 
 
+
+def _ingest_failure(exc: Exception) -> HTTPException:
+    """Turn an ingest failure into the right status and the right message.
+
+    A failed ingest must never answer 200. The status says what kind of
+    failure it was; the message says what to do about it.
+
+    * 422 — the document could not be parsed. The user's file is the
+      problem, and the message says why.
+    * 503 — a dependency is not there (the embedder, the store). The
+      user's document may be fine; the deployment is not.
+    * 500 — anything else. The message is redacted, so an internal
+      path never reaches the client; the full traceback is in the log.
+    """
+    if isinstance(exc, AtriumSetupError):
+        return HTTPException(503, _explain(exc))
+    if isinstance(exc, ValueError):
+        # A parse failure: the message is written for the person who
+        # uploaded the file, so it is passed through as it is.
+        return HTTPException(422, str(exc))
+    log_redacted_traceback(exc, where="ingest")
+    return HTTPException(500, f"ingestion failed: {redacted_traceback(exc)}")
+
+
 def _abort_startup(message: str) -> None:
     """Print the reason and leave, without a stack trace.
 
@@ -164,24 +188,7 @@ def _build_db():
     """Construct the vector-DB adapter (cached in `_db`)."""
     global _db
     if _db is None:
-        if DB_TYPE == "qdrant":
-            _db = QdrantAdapter(
-                host=env_str("QDRANT_HOST"), port=env_int("QDRANT_PORT"),
-            )
-        elif DB_TYPE == "pgvector":
-            _db = PgVectorAdapter(conn_info=env_str("PG_CONN"))
-        elif DB_TYPE in ("sqlite", "local", "file"):
-            # The local store: a SQLite file, no server. The default,
-            # because a fresh install that works beats a fresh install
-            # that needs Docker first.
-            from atrium.local_store import SqliteAdapter
-
-            _db = SqliteAdapter(path=env_str("LOCAL_DB_PATH"))
-        else:
-            raise ValueError(
-                f"unknown VECTOR_DB {DB_TYPE!r}; expected one of: "
-                f"sqlite, qdrant, pgvector"
-            )
+        _db = build_store()
     return _db
 
 
@@ -635,21 +642,20 @@ async def _run_one_ingestion(
     job_id = str(uuid.uuid4())
     final_doc_id = doc_id or str(uuid.uuid4())
     job_store.create(job_id, final_doc_id)
-    async with _ingest_semaphore:
-        await asyncio.to_thread(
-            run_ingestion, job_id, final_doc_id, file_bytes, filename, mime,
-            parser, embedder, _get_db(), job_store,
-            chunking_mode, chunking_config,
-        )
-    result = {"job_id": job_id, "doc_id": final_doc_id, "filename": filename}
-    # run_ingestion swallows the exception and records it on the job
-    # row, so the caller would otherwise get a 200 with a job_id and
-    # no idea the ingest failed. Surface the failure inline; the job
-    # row keeps the same error for anyone polling GET /jobs/{id}.
-    record = job_store.get(job_id)
-    if record and record.get("status") == "failed":
-        result["error"] = record.get("error") or "ingestion failed"
-    return result
+    try:
+        async with _ingest_semaphore:
+            await asyncio.to_thread(
+                run_ingestion, job_id, final_doc_id, file_bytes, filename, mime,
+                parser, embedder, _get_db(), job_store,
+                chunking_mode, chunking_config,
+            )
+    except HTTPException:
+        raise
+    except Exception as exc:
+        # A dependency that is missing, a document that will not parse,
+        # or anything else — each with the status that says which.
+        raise _ingest_failure(exc) from exc
+    return {"job_id": job_id, "doc_id": final_doc_id, "filename": filename}
 
 
 @app.post("/ingest")
@@ -698,11 +704,43 @@ async def ingest(
         requested_doc_ids.extend([None] * (len(files) - len(requested_doc_ids)))
 
     payloads = [(await f.read(), _upload_filename(f)) for f in files]
-    results = await asyncio.gather(
+    # `return_exceptions=True` because one bad file must not discard the
+    # other files' results — their work has already happened, and the
+    # client needs to know which of them landed.
+    settled = await asyncio.gather(
         *[_run_one_ingestion(raw, name, did, mode, config)
-          for (raw, name), did in zip(payloads, requested_doc_ids)]
+          for (raw, name), did in zip(payloads, requested_doc_ids)],
+        return_exceptions=True,
     )
-    return {"jobs": results}
+
+    results: List[dict] = []
+    failures: List[HTTPException] = []
+    for (_raw, name), outcome in zip(payloads, settled):
+        if isinstance(outcome, BaseException):
+            failure = (
+                outcome
+                if isinstance(outcome, HTTPException)
+                else HTTPException(500, "ingestion failed")
+            )
+            failures.append(failure)
+            results.append({
+                "job_id": None,
+                "doc_id": None,
+                "filename": name,
+                "error": failure.detail,
+            })
+        else:
+            results.append(outcome)
+
+    if not failures:
+        return {"jobs": results}
+    if len(failures) == len(results):
+        # Every file failed: answer with the first file's status, so a
+        # client that checks the status code sees a failure.
+        raise failures[0]
+    # Some succeeded and some did not. 207 says exactly that; a 200
+    # would tell the client the whole batch landed.
+    return JSONResponse(status_code=207, content={"jobs": results})
 
 
 @app.post("/ingest_single")
@@ -890,12 +928,16 @@ async def preview_chunks(
             "chunking_strategy": strategy,
             "chunks": formatted_chunks
         }
+    except HTTPException:
+        # A rejected request (size, MIME, chunking override) keeps its
+        # own status. It must not come back as a success.
+        raise
     except Exception as e:
-        # Log the full traceback server-side for ops, but only
-        # return a redacted message to the caller so internal file
-        # paths / source lines don't leak.
+        # The document could not be parsed or chunked. Log the full
+        # traceback server-side for ops, but return a redacted message
+        # to the caller so internal file paths / source lines don't leak.
         log_redacted_traceback(e, where="preview_chunks")
-        return {"error": redacted_traceback(e)}
+        raise HTTPException(422, f"could not parse or chunk the document: {redacted_traceback(e)}") from e
 
 @app.get("/visualize", response_class=HTMLResponse)
 def get_visualizer_ui():

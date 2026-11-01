@@ -32,7 +32,14 @@ def app_with_mocks(monkeypatch):
     from atrium.main import app
 
     fake_parser = MagicMock()
-    fake_parser.parse.return_value = []
+    # A parser that returns an element, so the ingest succeeds. A parser
+    # that returns nothing is a failed ingest — and a failed ingest is a
+    # 4xx, which is what the resilience tests assert.
+    from atrium.universal_parser import ParsedElement
+
+    fake_parser.parse.return_value = [
+        ParsedElement(type="paragraph", text="A paragraph of text.", page=1),
+    ]
 
     fake_embedder = MagicMock()
     fake_embedder.embed.return_value = [[0.0] * 8]
@@ -121,17 +128,19 @@ def test_ingest_single_back_compat(app_with_mocks):
     assert "doc_id" in body
 
 
-def test_ingest_oversize_rejected(app_with_mocks):
+def test_ingest_oversize_rejected(app_with_mocks, monkeypatch):
     app, _, _, _ = app_with_mocks
     client = TestClient(app)
+    # The cap is lowered rather than sending 100 MB: the assertion is
+    # about the status, not about the size.
+    monkeypatch.setenv("MAX_UPLOAD_BYTES", "1024")
     big = b"x" * (51 * 1024 * 1024)
     f = ("big.pdf", big, "application/pdf")
     res = client.post("/ingest_single", files={"file": f})
-    # Either rejected synchronously with 413, or accepted and reported
-    # in the per-file error field. Either is acceptable.
-    assert res.status_code in (200, 413)
-    if res.status_code == 200:
-        assert "error" in res.json() or "job_id" in res.json()
+    # Rejected synchronously with 413. It used to be allowed to answer
+    # 200 with an error in the body, which is a failure reported as a
+    # success.
+    assert res.status_code == 413
 
 
 # ---------------------------------------------------------------------------

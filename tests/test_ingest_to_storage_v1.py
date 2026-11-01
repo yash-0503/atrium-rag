@@ -166,6 +166,7 @@ class TestPipelineMetadataPropagation:
         db = MagicMock()
         db.upsert.return_value = None
         db.delete_stale_chunks.return_value = None
+        db.replace_chunks.return_value = None
 
         job_store = MagicMock()
 
@@ -185,9 +186,12 @@ class TestPipelineMetadataPropagation:
                 job_store=job_store,
             )
 
-        # db.upsert was called once with both chunks.
-        db.upsert.assert_called_once()
-        upserted = db.upsert.call_args.args[0]
+        # The store was written once, with both chunks. The write goes
+        # through `replace_chunks` — one call that writes this version
+        # of the document and removes the previous one — so that a
+        # crash between the two cannot leave two versions behind.
+        db.replace_chunks.assert_called_once()
+        upserted = db.replace_chunks.call_args.args[1]
         assert len(upserted) == 2
 
         # Find the parent and the child in the upserted list.
@@ -216,6 +220,7 @@ class TestPipelineMetadataPropagation:
         db = MagicMock()
         db.upsert.return_value = None
         db.delete_stale_chunks.return_value = None
+        db.replace_chunks.return_value = None
         job_store = MagicMock()
 
         with patch("atrium.pipeline.chunk_with_mode", return_value=[sc_flat]):
@@ -231,7 +236,7 @@ class TestPipelineMetadataPropagation:
                 job_store=job_store,
             )
 
-        upserted = db.upsert.call_args.args[0]
+        upserted = db.replace_chunks.call_args.args[1]
         assert len(upserted) == 1
         assert upserted[0].schema_version == 0
         assert upserted[0].is_parent is False
