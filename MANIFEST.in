@@ -34,3 +34,9 @@ exclude *.pyc
 exclude *.pyo
 recursive-exclude * __pycache__
 recursive-exclude * *.pyc
+
+# The README's images travel with it: the PyPI page renders the README
+# from the sdist, and a relative path to a file that is not there is a
+# broken image on the front page of the project.
+include docs/images/*.png
+include docs/images/*.gif

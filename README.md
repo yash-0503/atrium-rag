@@ -1,6 +1,12 @@
 # Atrium
 
-Parse, chunk, embed and retrieve documents — PDF, Office, HTML, Markdown, images — into a vector store.
+**Put a folder of PDFs, Word documents and spreadsheets somewhere, and ask it questions in plain language.**
+
+Atrium is a document-ingestion library and HTTP service. It parses a
+document into structure, cuts it into chunks that keep that structure
+attached, embeds those chunks, and stores them in a vector database — so
+a later question can find the paragraph that answers it, not just the
+document that contains it.
 
 ```bash
 pip install atrium-rag
@@ -10,29 +16,45 @@ pip install atrium-rag
 
 - **Python:** 3.10+
 - **Vector DB:** SQLite (default), Qdrant or pgvector
-- **Embeddings:** any OpenAI-compatible `/v1/embeddings` endpoint (Ollama, OpenAI, vLLM, LM Studio, TEI)
+- **Embeddings:** any OpenAI-compatible `/v1/embeddings` endpoint (Ollama, OpenAI, vLLM, LM Studio, TEI) — or none, with the in-process embedder
 - **License:** MIT
 
 ---
 
-## How it works
+## Why
 
-```
-bytes → parse → elements → chunk → embed → upsert          (ingest)
-query → embed → search → rerank → dedup → parent-resolve  (retrieve)
-```
+The usual way to make documents searchable is to assemble four
+libraries yourself: a parser, a chunker, an embedder and a vector
+store, then write the glue that keeps their document IDs in agreement.
+The parsers are heavy — Docling pulls in a model runtime and a few
+gigabytes of dependencies — and most of them want a GPU or a paid API
+key before they will read a page.
 
-The parse step is pure Python and heuristic — no model, no API key, no
-GPU. The chunker is structure-aware: it keeps headings, tables and
-list items intact and carries the heading path into the embedding
-text, so a chunk retrieved from the middle of a section still knows
-where it came from.
+Atrium takes the opposite position. The parsing is pure Python and
+heuristic: no model, no API key, no GPU, and no licence obligations
+beyond MIT. It reads the document's own structure — headings, tables,
+list items — and carries that structure into the chunk, so a sentence
+pulled out of the middle of a section still knows where it came from.
 
-Retrieval is dense similarity over the embeddings, with an optional
-cross-encoder rerank stage. The library also carries a BM25 ranker and
-a confidence gate that fuses the two with Reciprocal Rank Fusion — but
-no endpoint or command passes it a sparse index, so from the product's
-point of view it does not exist yet.
+The cost of that choice is measured, not asserted. On the same 23
+documents, with each system using its own parser and chunker and the
+same embedding model:
+
+| system | R@5 | R@10 | MRR | parse time | peak RSS |
+|---|---|---|---|---|---|
+| **atrium** | **0.700** | **0.769** | **0.574** | 88 s | 1016 MB |
+| docling | 0.686 | 0.726 | 0.540 | 554 s | 3482 MB |
+| unstructured | 0.614 | 0.688 | 0.486 | 195 s | 855 MB |
+
+Retrieval accuracy is on par with Docling at this corpus size — the
+difference is inside the confidence interval. The separation is in
+cost: atrium parses the corpus in a sixth of the time and a third of
+the memory.
+
+*(The harness, the corpus and the exact commands are published
+separately in the [`atrium-benchmarks`](https://github.com/yash-0503/atrium-benchmarks)
+repository, so the numbers can be reproduced. The comparison is
+described in more detail under [Evaluation](#evaluation).)*
 
 ---
 
@@ -51,6 +73,11 @@ container, shows you the configuration before it is written, and then
 checks it by making a real embedding call. Everything it offers to do,
 it asks first.
 
+Nothing else is required. With no server running, `atrium init` can
+point you at the in-process embedder — pick **in-process** when it
+asks, and it offers to install the extra itself. The default vector
+store is a SQLite file next to your project.
+
 ### Ingest and search over HTTP
 
 ```bash
@@ -65,6 +92,9 @@ curl -X POST http://localhost:8000/search \
     -H 'Content-Type: application/json' \
     -d '{"query": "What is the retention policy?", "top_k": 8}'
 ```
+
+One file is one entry in `files`; several files in one request are
+ingested concurrently and each gets its own record back.
 
 ### From the shell
 
@@ -105,95 +135,22 @@ for hit in hits:
 
 ---
 
-## Configuration
+## The API
 
-Every setting is an environment variable. Put them in `.env` (run
-`atrium init` to generate one) or export them. A real environment
-variable beats `.env`, and `.env` beats the built-in default.
-
-| Variable | Default | What it does |
-|---|---|---|
-| `VECTOR_DB` | `sqlite` | `sqlite`, `qdrant` or `pgvector` |
-| `ATRIUM_BIND` | `127.0.0.1` | The address `atrium serve` binds |
-| `LOCAL_DB_PATH` | `atrium_local.db` | Where the local store keeps its file |
-| `QDRANT_HOST` / `QDRANT_PORT` | `localhost` / `6333` | Qdrant address |
-| `PG_CONN` | — | Postgres DSN, when `VECTOR_DB=pgvector` |
-| `EMBED_BASE_URL` | `http://localhost:11434/v1` | Any OpenAI-compatible `/v1` endpoint |
-| `EMBED_API_KEY` | — | Key for that endpoint; blank for local servers |
-| `EMBED_PROVIDER` | `http` | `http`, or `fastembed` for the in-process embedder |
-| `EMBED_MODEL` | `bge-large` | Model name, as that endpoint knows it |
-| `EMBED_DIM` | `1024` | Must match the model's dimension |
-| `DEFAULT_TOP_K` | `8` | Results returned by `/search` |
-| `OCR_ENABLED` | `0` | OCR for scanned pages |
-| `OCR_PROVIDER` | `tesseract` | `tesseract` or `rapidocr` |
-| `OCR_LANG` | `eng` | Language code |
-| `RERANK_ENABLED` | `0` | Cross-encoder reranking |
-| `RERANK_PROVIDER` | `bge` | `bge`, `flashrank` or `cohere` |
-| `RERANK_MODEL` | provider default | Cross-encoder id |
-| `VISION_ENABLED` | `0` | Caption images with a vision model |
-| `VISION_MODEL` | `minicpm-v4.6:1b` | Vision model tag |
-| `ATRIUM_PDF_BACKEND` | `pdfplumber` | PDF library: `pdfplumber` or `pymupdf` |
-| `API_KEY` | — | Bearer token; empty = no auth (dev only) |
-| `ALLOWED_MIME_TYPES` | — | Comma-separated allowlist; empty = any |
-| `JOB_DB_PATH` | `jobs.db` | The async job queue (SQLite) |
-| `INGEST_CONCURRENCY` | `4` | Documents ingested at once |
-| `ATRIUM_DATA_DIR` | — | Where the local files live; the API and the worker must agree |
-| `MAX_UPLOAD_BYTES` | `104857600` | Upload cap (100 MB) |
-| `MAX_FILES_PER_REQUEST` | `32` | Files in one `/ingest` request |
-| `MAX_CHUNKS_PER_DOCUMENT` | `50000` | Ceiling on one document's chunks |
-| `MAX_JOB_ATTEMPTS` | `3` | Attempts before a job is given up on |
-| `JOB_RETENTION_SECONDS` | `86400` | How long a finished job row is kept |
-| `LOG_LEVEL` | `INFO` | `DEBUG`…`ERROR` |
-
-`.env.example` has the full list with comments.
-
-Reranking is off by default: it improves ranking on most corpora but
-regresses on forms, slides, math and OCR'd scans, because the
-cross-encoder was trained on web QA.
-
----
-
-## Vector stores
-
-| `VECTOR_DB` | What it needs | When to use it |
-|---|---|---|
-| `sqlite` | nothing — a file next to your project | the default; a personal or team corpus |
-| `qdrant` | a running Qdrant | the corpus outgrows a file on disk |
-| `pgvector` | Postgres with the `pgvector` extension | you already run Postgres, and want one database |
-
-The local store is a SQLite file plus a cosine search over it — the
-standard library and nothing else, no server, no Docker, no container.
-It is the default so that a fresh install works before you install
-anything else.
-
-Its search scans every stored vector, so its cost grows with the
-corpus: about 5 ms at a thousand chunks, about 30 ms at five thousand,
-about 300 ms at twenty thousand. It is the right store for a personal
-or team corpus; past roughly twenty thousand chunks, move to Qdrant or
-pgvector. `atrium doctor` says so when the corpus gets there.
-
-The embedding provider is configured the same way whatever the store:
-any server that speaks the OpenAI `/v1/embeddings` API (Ollama, OpenAI,
-vLLM, LM Studio, TEI, Together), or the in-process ONNX embedder from
-the `local` extra, which needs no server and no key.
-
----
-
-## API
+Five routes carry the contract. The rest are for looking at what the
+parser produced, and are not part of it.
 
 | Endpoint | What it does |
 |---|---|
 | `POST /ingest` | Ingest files inline — parsed, embedded and stored before the response |
-| `POST /ingest_single` | Same, one file |
 | `POST /jobs` | Queue a file for the worker; returns `202` + `job_id` |
 | `GET /jobs/{job_id}` | Job status: `pending`, `running`, `complete`, `failed` |
 | `POST /search` | Search the corpus |
-| `POST /preview` | Parse + chunk without embedding or storing |
-| `GET /retrieval_lab` | In-browser sandbox for a single document |
-| `POST /retrieval_lab/prepare` | Load a document into the sandbox |
-| `POST /retrieval_lab/search` | Query the sandbox |
 | `GET /health` | Liveness + dependency probe |
-| `GET /visualize` | Chunk visualiser |
+
+`POST /preview` sits with them: it parses and chunks without embedding
+or storing anything, which is how you check what the parser made of a
+document before committing it to the corpus.
 
 ### `POST /search`
 
@@ -255,6 +212,95 @@ at 700 characters with 100 characters of overlap — and adjusts the
 parameters to the shape of the document. `context_rich` adds a parent
 chunk over each section. The strategy that actually ran is stamped on
 every chunk, so a corpus with mixed strategies stays auditable.
+
+---
+
+## The playground
+
+Two pages ship with the service. They are for looking at the parser's
+output, and they are the fastest way to find out what a document
+actually contains.
+
+![the chunk visualiser: a document dropped in, the chunks it produced](docs/images/visualize.gif)
+
+| Route | What it is |
+|---|---|---|
+| `GET /visualize` | Drop a document in; see the chunks it produced, with their headings, pages and sizes |
+| `GET /retrieval_lab` | Load one document into an in-memory sandbox and query it without touching the corpus |
+
+The clip above is NIST SP 800-61r2, parsed by the default backend:
+398 chunks, each one with its page, its element type and a content
+hash.
+
+`/visualize` loads Tailwind from a CDN, so it needs a network
+connection; there is no offline build.
+
+---
+
+## Configuration
+
+Every setting is an environment variable. Put them in `.env` (run
+`atrium init` to generate one) or export them. A real environment
+variable beats `.env`, and `.env` beats the built-in default. The full
+list, with comments, is in `.env.example`.
+
+| Variable | Default | What it does |
+|---|---|---|
+| `VECTOR_DB` | `sqlite` | `sqlite`, `qdrant` or `pgvector` |
+| `ATRIUM_BIND` | `127.0.0.1` | The address `atrium serve` binds |
+| `LOCAL_DB_PATH` | `atrium_local.db` | Where the local store keeps its file |
+| `QDRANT_HOST` / `QDRANT_PORT` | `localhost` / `6333` | Qdrant address |
+| `PG_CONN` | — | Postgres DSN, when `VECTOR_DB=pgvector` |
+| `EMBED_BASE_URL` | `http://localhost:11434/v1` | Any OpenAI-compatible `/v1` endpoint |
+| `EMBED_API_KEY` | — | Key for that endpoint; blank for local servers |
+| `EMBED_PROVIDER` | `http` | `http`, or `fastembed` for the in-process embedder |
+| `EMBED_MODEL` | `bge-large` | Model name, as that endpoint knows it |
+| `EMBED_DIM` | `1024` | Must match the model's dimension |
+| `DEFAULT_TOP_K` | `8` | Results returned by `/search` |
+| `OCR_ENABLED` | `0` | OCR for scanned pages |
+| `OCR_PROVIDER` | `tesseract` | `tesseract` or `rapidocr` |
+| `OCR_LANG` | `eng` | Language code |
+| `RERANK_ENABLED` | `0` | Cross-encoder reranking |
+| `RERANK_PROVIDER` | `bge` | `bge`, `flashrank` or `cohere` |
+| `RERANK_MODEL` | provider default | Cross-encoder id |
+| `VISION_ENABLED` | `0` | Caption images with a vision model |
+| `ATRIUM_PDF_BACKEND` | `pdfplumber` | PDF library: `pdfplumber` or `pymupdf` |
+| `API_KEY` | — | Bearer token; empty = no auth (dev only) |
+| `ALLOWED_MIME_TYPES` | — | Comma-separated allowlist; empty = any |
+
+Reranking is off by default: it improves ranking on most corpora but
+regresses on forms, slides, math and OCR'd scans, because the
+cross-encoder was trained on web QA.
+
+The service binds `127.0.0.1` by default. `API_KEY` empty means every
+endpoint is open, so set it for anything that is not a laptop —
+`atrium doctor` tells you if you have not.
+
+---
+
+## Vector stores
+
+| `VECTOR_DB` | What it needs | When to use it |
+|---|---|---|
+| `sqlite` | nothing — a file next to your project | the default; a personal or team corpus |
+| `qdrant` | a running Qdrant | the corpus outgrows a file on disk |
+| `pgvector` | Postgres with the `pgvector` extension | you already run Postgres, and want one database |
+
+The local store is a SQLite file plus a cosine search over it — the
+standard library and nothing else, no server, no Docker, no container.
+It is the default so that a fresh install works before you install
+anything else.
+
+Its search scans every stored vector, so its cost grows with the
+corpus: about 5 ms at a thousand chunks, about 30 ms at five thousand,
+about 300 ms at twenty thousand. It is the right store for a personal
+or team corpus; past roughly twenty thousand chunks, move to Qdrant or
+pgvector. `atrium doctor` says so when the corpus gets there.
+
+The embedding provider is configured the same way whatever the store:
+any server that speaks the OpenAI `/v1/embeddings` API (Ollama, OpenAI,
+vLLM, LM Studio, TEI, Together), or the in-process ONNX embedder from
+the `local` extra, which needs no server and no key.
 
 ---
 
@@ -383,28 +429,20 @@ tests skip rather than pass quietly.
 Retrieval quality is measured against Docling and Unstructured on a
 corpus of 29 documents — academic papers, government reports, forms,
 scanned pages, CJK and Arabic — with 700 questions across five
-difficulty tiers. The harness, the corpus and the results are
-published separately, in the `atrium-benchmarks` repository.
+difficulty tiers. Each system parses and chunks with its own pipeline
+and embeds with the same model, so the comparison isolates the part
+that is usually bought off the shelf.
 
-On the 23 documents that carry a question set, with each system using
-its own parser and chunker and the same embedding model:
+The numbers are in [Why](#why), above. Two caveats belong with them:
 
-| system | R@5 | R@10 | MRR | parse time | peak RSS |
-|---|---|---|---|---|---|
-| **atrium** | **0.700** | **0.769** | **0.574** | 88 s | 1016 MB |
-| docling | 0.686 | 0.726 | 0.540 | 554 s | 3482 MB |
-| unstructured | 0.614 | 0.688 | 0.486 | 195 s | 855 MB |
-
-Retrieval accuracy is on par with Docling at this corpus size — the
-difference is inside the confidence interval, which the report states
-with the interval. The separation is in cost: atrium parses the corpus
-in a sixth of the time and a third of the memory.
-
-The hard, implicit and unanswerable tiers are machine-drafted and
-queued for human sign-off; `python -m eval_v2.review_cli status`
-reports how many are still open, and the harness prints that count on
-every run. The numbers above are from the run in which those questions
-were still open, so read them as provisional.
+- The hard, implicit and unanswerable tiers are machine-drafted and
+  queued for human sign-off; `python -m eval_v2.review_cli status`
+  reports how many are still open, and the harness prints that count on
+  every run. The published numbers come from a run in which those
+  questions were still open, so read them as provisional.
+- Two document types are known weak spots: two-column academic papers
+  and government forms. The harness reports per-document coverage, so
+  the gap is visible rather than averaged away.
 
 The harness, the corpus and the exact commands are published in the
 `atrium-benchmarks` repository, so the numbers can be reproduced. See
