@@ -167,6 +167,11 @@ dev = [
     # Two test files build synthetic PDFs with fitz. The product itself
     # does not need PyMuPDF — the default backend is pdfplumber.
     "pymupdf>=1.24.0",
+    # scripts/record_visualizer_gif.py drives a real Chrome over the
+    # DevTools protocol and writes the GIF with Pillow. A maintainer
+    # tool, not a dependency of the product.
+    "pillow>=10.0",
+    "websockets>=12.0",
 ]
 
 [project.urls]
