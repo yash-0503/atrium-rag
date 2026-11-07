@@ -144,8 +144,8 @@ def test_an_invalid_chunking_config_is_a_422(app_with_mocks):
     app, _, _, _ = app_with_mocks
     client = TestClient(app)
     res = client.post(
-        "/ingest_single",
-        files={"file": ("a.pdf", b"%PDF-1.4", "application/pdf")},
+        "/ingest",
+        files=[("files", ("a.pdf", b"%PDF-1.4", "application/pdf"))],
         data={"chunking_mode": "custom", "chunking_config": '{"target_chars": -5}'},
     )
     assert res.status_code == 422
@@ -235,8 +235,8 @@ def test_an_oversize_file_is_rejected_before_it_is_read(app_with_mocks, monkeypa
     app, _, _, _ = app_with_mocks
     client = TestClient(app)
     res = client.post(
-        "/ingest_single",
-        files={"file": ("a.pdf", b"x" * 4096, "application/pdf")},
+        "/ingest",
+        files=[("files", ("a.pdf", b"x" * 4096, "application/pdf"))],
     )
     assert res.status_code == 413
 

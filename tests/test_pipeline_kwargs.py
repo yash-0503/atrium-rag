@@ -7,7 +7,7 @@ arguments and forward them unchanged to chunk_with_mode.
 Two callers rely on this signature:
 
   1. app/main.py:218-221 (asyncio.to_thread call from /ingest and
-     /ingest_single). Invoked with positional args only — no
+     /ingest). Invoked with positional args only — no
      chunking kwargs. The historical behavior (mode='auto',
      config=None) must be preserved.
 
@@ -145,7 +145,7 @@ def test_run_ingestion_forwards_context_rich_explicit_settings():
 
 
 def test_run_ingestion_defaults_to_auto_and_none_when_no_kwargs():
-    """Existing /ingest and /ingest_single callers invoke run_ingestion
+    """Existing /ingest callers invoke run_ingestion
     without any chunking kwargs. run_ingestion must still use the
     historical defaults: mode='auto', config=None.
 

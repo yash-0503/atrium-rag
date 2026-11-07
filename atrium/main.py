@@ -724,8 +724,7 @@ async def ingest(
     """Ingest one or more files. Each file becomes its own job, capped at
     INGEST_CONCURRENCY in flight at once. Returns one record per file.
 
-    For the legacy single-file SDK call, use POST /ingest_single (kept
-    for back-compat with the 0.x wire format).
+    A single file is the same call with one entry in `files`.
 
     `chunking_mode` / `chunking_config` override the server's chunking
     for this request only. The strategy that actually ran is recorded
@@ -818,29 +817,6 @@ async def ingest(
     # Some succeeded and some did not. 207 says exactly that; a 200
     # would tell the client the whole batch landed.
     return JSONResponse(status_code=207, content={"jobs": results})
-
-
-@app.post("/ingest_single")
-async def ingest_single(
-    request: Request,
-    file: UploadFile,
-    doc_id: Optional[str] = Form(None),
-    chunking_mode: str = Form("auto"),
-    chunking_config: Optional[str] = Form(None),
-):
-    """Single-file back-compat endpoint. Same behavior as /ingest with one
-    file; preserved so existing SDK calls don't break."""
-    check_content_length(request.headers.get("content-length"))
-    mode, config = _parse_chunking_overrides(chunking_mode, chunking_config)
-    limit = max_upload_bytes()
-    size = getattr(file, "size", None)
-    if size is not None and limit and size > limit:
-        raise HTTPException(
-            413,
-            f"upload exceeds MAX_UPLOAD_BYTES={limit} (file is {size} bytes)",
-        )
-    file_bytes = await file.read()
-    return await _run_one_ingestion(file_bytes, _upload_filename(file), doc_id, mode, config)
 
 
 # --- Async enqueue -------------------------------------------------------

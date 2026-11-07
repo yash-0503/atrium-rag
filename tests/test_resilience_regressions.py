@@ -197,8 +197,8 @@ def test_ingest_returns_422_when_the_document_cannot_be_parsed(app_with_mocks):
     parser.parse.side_effect = ValueError("PDF is corrupt or unreadable")
     client = TestClient(app)
     res = client.post(
-        "/ingest_single",
-        files={"file": ("a.pdf", b"%PDF-1.4 broken", "application/pdf")},
+        "/ingest",
+        files=[("files", ("a.pdf", b"%PDF-1.4 broken", "application/pdf"))],
     )
     assert res.status_code == 422
     assert "corrupt" in res.json()["detail"]
@@ -214,8 +214,8 @@ def test_ingest_returns_503_when_the_embedder_is_unavailable(app_with_mocks):
     )
     client = TestClient(app)
     res = client.post(
-        "/ingest_single",
-        files={"file": ("a.pdf", b"%PDF-1.4", "application/pdf")},
+        "/ingest",
+        files=[("files", ("a.pdf", b"%PDF-1.4", "application/pdf"))],
     )
     assert res.status_code == 503
     assert "not answering" in res.json()["detail"]

@@ -126,7 +126,7 @@ def check_routes():
 
     paths = {r.path for r in app.routes}
     expected = {
-        "/health", "/ingest", "/ingest_single", "/jobs", "/search",
+        "/health", "/ingest", "/jobs", "/search",
         "/preview", "/retrieval_lab", "/visualize",
     }
     missing = expected - paths

@@ -117,15 +117,17 @@ def test_multi_file_ingest_returns_list_of_jobs(app_with_mocks):
         assert "doc_id" in entry
 
 
-def test_ingest_single_back_compat(app_with_mocks):
+def test_ingest_one_file(app_with_mocks):
+    """One file is the same call with one entry in `files`."""
     app, _, _, _ = app_with_mocks
     client = TestClient(app)
     f = ("a.pdf", b"%PDF-1.4\n%\xe2\xe3\xcf\xd3\n1 0 obj\n<<>>\nendobj\nxref\n0 1\n0000000000 65535 f\ntrailer\n<<>>\nstartxref\n9\n%%EOF", "application/pdf")
-    res = client.post("/ingest_single", files={"file": f})
+    res = client.post("/ingest", files=[("files", f)])
     assert res.status_code == 200
     body = res.json()
-    assert "job_id" in body
-    assert "doc_id" in body
+    assert len(body["jobs"]) == 1
+    assert "job_id" in body["jobs"][0]
+    assert "doc_id" in body["jobs"][0]
 
 
 def test_ingest_oversize_rejected(app_with_mocks, monkeypatch):
@@ -136,7 +138,7 @@ def test_ingest_oversize_rejected(app_with_mocks, monkeypatch):
     monkeypatch.setenv("MAX_UPLOAD_BYTES", "1024")
     big = b"x" * (51 * 1024 * 1024)
     f = ("big.pdf", big, "application/pdf")
-    res = client.post("/ingest_single", files={"file": f})
+    res = client.post("/ingest", files=[("files", f)])
     # Rejected synchronously with 413. It used to be allowed to answer
     # 200 with an error in the body, which is a failure reported as a
     # success.

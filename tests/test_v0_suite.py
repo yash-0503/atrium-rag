@@ -105,26 +105,24 @@ def test_chunk_record_validation():
 def test_reject_empty_file():
     """Empty files must fail gracefully before processing.
 
-    M0-4 (2026-10-10): the multi-file /ingest expects form field
-    `files` (plural). The single-file /ingest_single keeps `file`
-    (singular). Use /ingest_single here so the test targets the
-    single-file contract; the prior version used `file` against
+    M0-4 (2026-10-10): /ingest expects the form field `files`
+    (plural), repeatable. The prior version used `file` against
     /ingest and was silently rejected with 422 before the handler
-    ran."""
+    ran. One file is one entry in `files`."""
     res = client.post(
-        "/ingest_single",
-        files={"file": ("empty.pdf", b"", "application/pdf")},
+        "/ingest",
+        files=[("files", ("empty.pdf", b"", "application/pdf"))],
     )
-    # Empty file: handler returns 200 with an inline error field
-    # (per app/main.py:_run_one_ingestion). Either way it must NOT
+    # Empty file: the handler refuses it. Either way it must NOT
     # succeed silently with empty content — assert that the
     # response is NOT 200 with a successful job_id.
     assert res.status_code in (200, 400, 422)
     if res.status_code == 200:
         body = res.json()
         # If 200, the empty file should have produced an error
-        # field, not a successful job_id.
-        assert "error" in body or "job_id" not in body
+        # entry, not a successful job_id.
+        jobs = body.get("jobs") or []
+        assert jobs and ("error" in jobs[0] or "job_id" not in jobs[0])
 
 
 def test_reject_oversized_file():

@@ -8,7 +8,7 @@ loses the status of every in-flight or recent /ingest job.
 
 Two kinds of job live in the same table
 ----------------------------------------
-**Inline jobs** (``/ingest``, ``/ingest_single``) are created with
+**Inline jobs** (``/ingest``) are created with
 ``create()`` and processed by the API process itself. They carry no
 payload and are never handed to a worker.
 
