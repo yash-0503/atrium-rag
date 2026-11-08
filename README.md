@@ -2,11 +2,10 @@
 
 **Put a folder of PDFs, Word documents and spreadsheets somewhere, and ask it questions in plain language.**
 
-Atrium is a document-ingestion library and HTTP service. It parses a
-document into structure, cuts it into chunks that keep that structure
-attached, embeds those chunks, and stores them in a vector database — so
-a later question can find the paragraph that answers it, not just the
-document that contains it.
+Atrium reads a document into its structure, cuts it into chunks that keep
+that structure attached, embeds those chunks, and stores them in a vector
+database. A later question finds the paragraph that answers it — and the
+page it came from.
 
 ```bash
 pip install atrium-rag
@@ -21,64 +20,28 @@ pip install atrium-rag
 
 ---
 
-## Why
-
-The usual way to make documents searchable is to assemble four
-libraries yourself: a parser, a chunker, an embedder and a vector
-store, then write the glue that keeps their document IDs in agreement.
-The parsers are heavy — Docling pulls in a model runtime and a few
-gigabytes of dependencies — and most of them want a GPU or a paid API
-key before they will read a page.
-
-Atrium takes the opposite position. The parsing is pure Python and
-heuristic: no model, no API key, no GPU, and no licence obligations
-beyond MIT. It reads the document's own structure — headings, tables,
-list items — and carries that structure into the chunk, so a sentence
-pulled out of the middle of a section still knows where it came from.
-
-The cost of that choice is measured, not asserted. On the same 23
-documents, with each system using its own parser and chunker and the
-same embedding model:
-
-| system | R@5 | R@10 | MRR | parse time | peak RSS |
-|---|---|---|---|---|---|
-| **atrium** | **0.700** | **0.769** | **0.574** | 88 s | 1016 MB |
-| docling | 0.686 | 0.726 | 0.540 | 554 s | 3482 MB |
-| unstructured | 0.614 | 0.688 | 0.486 | 195 s | 855 MB |
-
-Retrieval accuracy is on par with Docling at this corpus size — the
-difference is inside the confidence interval. The separation is in
-cost: atrium parses the corpus in a sixth of the time and a third of
-the memory.
-
-*(The harness, the corpus and the exact commands are published
-separately in the [`atrium-benchmarks`](https://github.com/yash-0503/atrium-benchmarks)
-repository, so the numbers can be reproduced. The comparison is
-described in more detail under [Evaluation](#evaluation).)*
-
----
-
-## Quickstart
-
-### Set it up
+## Install
 
 ```bash
 pip install atrium-rag
-atrium init             # checks your machine, writes .env, verifies it works
+atrium init
 ```
 
 `atrium init` looks at what is installed, asks which vector store and
 which embedding provider you want, offers to pull a model or start a
 container, shows you the configuration before it is written, and then
-checks it by making a real embedding call. Everything it offers to do,
-it asks first.
+checks it by making a real embedding call. Everything it offers to do, it
+asks first.
 
-Nothing else is required. With no server running, `atrium init` can
-point you at the in-process embedder — pick **in-process** when it
-asks, and it offers to install the extra itself. The default vector
-store is a SQLite file next to your project.
+With no server running, choose **in-process** when it asks and it offers
+to install the extra itself — a small model on your machine, no key, no
+GPU. The default vector store is a SQLite file next to your project.
 
-### Ingest and search over HTTP
+---
+
+## Use it
+
+### Over HTTP
 
 ```bash
 atrium serve            # http://localhost:8000, docs at /docs
@@ -94,7 +57,7 @@ curl -X POST http://localhost:8000/search \
 ```
 
 One file is one entry in `files`; several files in one request are
-ingested concurrently and each gets its own record back.
+ingested at the same time and each gets its own record back.
 
 ### From the shell
 
@@ -130,15 +93,12 @@ ingest_document(
 hits = retrieve_and_rerank(db, embedder.embed(["retention policy"])[0],
                             "retention policy", top_k=8)
 for hit in hits:
-    print(hit["score"], hit["doc_id"], hit["text"][:80])
+    print(hit["score"], hit["page_number"], hit["text"][:80])
 ```
 
 ---
 
 ## The API
-
-Five routes carry the contract. The rest are for looking at what the
-parser produced, and are not part of it.
 
 | Endpoint | What it does |
 |---|---|
@@ -147,10 +107,10 @@ parser produced, and are not part of it.
 | `GET /jobs/{job_id}` | Job status: `pending`, `running`, `complete`, `failed` |
 | `POST /search` | Search the corpus |
 | `GET /health` | Liveness + dependency probe |
+| `POST /preview` | Parse + chunk a document without embedding or storing it |
 
-`POST /preview` sits with them: it parses and chunks without embedding
-or storing anything, which is how you check what the parser made of a
-document before committing it to the corpus.
+`POST /preview` is how you check what the parser made of a document
+before you commit it to the corpus.
 
 ### `POST /search`
 
@@ -183,57 +143,61 @@ omitted follows `RERANK_ENABLED`.
 }
 ```
 
+Every result carries where it came from: the page, the heading path, the
+element type and the chunking strategy that produced it.
+
 ### `POST /jobs`
 
-Queue a document for asynchronous ingestion. The response is
-immediate; a worker does the work.
+Queue a document for asynchronous ingestion. The response is immediate; a
+worker does the work.
 
 ```bash
 curl -X POST http://localhost:8000/jobs -F "file=@./big-report.pdf"
 ```
 
 Bodies over 50 MB get `413`; a file whose declared content type
-contradicts its bytes gets `415`.
+contradicts its bytes gets `415`. A worker drains the queue:
 
-### Chunking modes
+```bash
+python -m atrium.worker
+```
 
-`auto` (default), `balanced`, `precise`, `context_rich`, or `custom`
-with an explicit config:
+Workers claim jobs atomically, so several can share one queue file
+without processing a document twice.
+
+### Chunking
+
+A chunk is a slice of a document, and the slice decides how well the
+document can be searched later. Atrium ships five ways to cut one:
+
+| Strategy | What it does |
+|---|---|
+| `baseline` | A sliding window over characters. Fastest. |
+| `sentence_bounded` | Splits on sentence boundaries, then packs the sentences up. |
+| `recursive_token` | Splits small, then merges upward. |
+| `structure_aware` | Respects the element types: tables stay whole, code stays whole, headings ride on top as a breadcrumb. |
+| `parent_child` | Wide parents for context, small children for retrieval. |
+
+You pick one with `chunking_mode`:
+
+| Mode | Strategy | Sizes |
+|---|---|---|
+| `auto` (default) | `structure_aware` | 700 chars, 100 overlap |
+| `balanced` | `baseline` | 1000 chars, 150 overlap |
+| `precise` | `structure_aware` | 700 chars, 100 overlap |
+| `context_rich` | `parent_child` | 1000-char children under 3000-char parents |
+| `custom` | any of the five | yours |
 
 ```bash
 curl -X POST http://localhost:8000/ingest \
     -F "files=@./doc.pdf" \
     -F "chunking_mode=custom" \
-    -F 'chunking_config={"target_chars": 900}'
+    -F 'chunking_config={"strategy": "sentence_bounded", "target_chars": 900}'
 ```
 
-`auto` resolves to the `precise` strategy — structure-aware chunking
-at 700 characters with 100 characters of overlap — and adjusts the
-parameters to the shape of the document. `context_rich` adds a parent
-chunk over each section. The strategy that actually ran is stamped on
-every chunk, so a corpus with mixed strategies stays auditable.
-
----
-
-## The playground
-
-Two pages ship with the service. They are for looking at the parser's
-output, and they are the fastest way to find out what a document
-actually contains.
-
-![the chunk visualiser: a document dropped in, the chunks it produced](docs/images/visualize.gif)
-
-| Route | What it is |
-|---|---|---|
-| `GET /visualize` | Drop a document in; see the chunks it produced, with their headings, pages and sizes |
-| `GET /retrieval_lab` | Load one document into an in-memory sandbox and query it without touching the corpus |
-
-The clip above is NIST SP 800-61r2, parsed by the default backend:
-398 chunks, each one with its page, its element type and a content
-hash.
-
-`/visualize` loads Tailwind from a CDN, so it needs a network
-connection; there is no offline build.
+`auto` is `precise` today — the same structure-aware cut for every
+document. The strategy that actually ran is stamped on every chunk, so a
+corpus built with mixed strategies stays auditable.
 
 ---
 
@@ -261,20 +225,18 @@ list, with comments, is in `.env.example`.
 | `OCR_PROVIDER` | `tesseract` | `tesseract` or `rapidocr` |
 | `OCR_LANG` | `eng` | Language code |
 | `RERANK_ENABLED` | `0` | Cross-encoder reranking |
-| `RERANK_PROVIDER` | `bge` | `bge`, `flashrank` or `cohere` |
+| `RERANK_BACKEND` | `bge-local` | `bge-local`, `flashrank` or `cohere` |
 | `RERANK_MODEL` | provider default | Cross-encoder id |
 | `VISION_ENABLED` | `0` | Caption images with a vision model |
 | `ATRIUM_PDF_BACKEND` | `pdfplumber` | PDF library: `pdfplumber` or `pymupdf` |
 | `API_KEY` | — | Bearer token; empty = no auth (dev only) |
 | `ALLOWED_MIME_TYPES` | — | Comma-separated allowlist; empty = any |
 
-Reranking is off by default: it improves ranking on most corpora but
-regresses on forms, slides, math and OCR'd scans, because the
-cross-encoder was trained on web QA.
-
-The service binds `127.0.0.1` by default. `API_KEY` empty means every
-endpoint is open, so set it for anything that is not a laptop —
-`atrium doctor` tells you if you have not.
+Two defaults worth knowing: **reranking is off**, because it improves
+ranking on most corpora and regresses on forms, slides, math and scanned
+pages; and the service **binds `127.0.0.1`**, so set `API_KEY` before you
+put it anywhere else. `atrium doctor` checks the embedder, the store and
+your security posture.
 
 ---
 
@@ -287,18 +249,14 @@ endpoint is open, so set it for anything that is not a laptop —
 | `pgvector` | Postgres with the `pgvector` extension | you already run Postgres, and want one database |
 
 The local store is a SQLite file plus a cosine search over it — the
-standard library and nothing else, no server, no Docker, no container.
-It is the default so that a fresh install works before you install
-anything else.
+standard library and nothing else, no server, no Docker. Its search
+scans every stored vector, so its cost grows with the corpus: about
+5 ms at a thousand chunks, about 30 ms at five thousand. Past roughly
+twenty thousand chunks, move to Qdrant or pgvector; `atrium doctor` says
+so when the corpus gets there.
 
-Its search scans every stored vector, so its cost grows with the
-corpus: about 5 ms at a thousand chunks, about 30 ms at five thousand,
-about 300 ms at twenty thousand. It is the right store for a personal
-or team corpus; past roughly twenty thousand chunks, move to Qdrant or
-pgvector. `atrium doctor` says so when the corpus gets there.
-
-The embedding provider is configured the same way whatever the store:
-any server that speaks the OpenAI `/v1/embeddings` API (Ollama, OpenAI,
+The embedding provider is configured the same way whatever the store: any
+server that speaks the OpenAI `/v1/embeddings` API (Ollama, OpenAI,
 vLLM, LM Studio, TEI, Together), or the in-process ONNX embedder from
 the `local` extra, which needs no server and no key.
 
@@ -314,49 +272,14 @@ the `local` extra, which needs no server and no key.
 | `atrium doctor` | Probe the stack: embedder, vector DB, security posture |
 | `atrium ingest` | Ingest files or directories |
 | `atrium search` | Query the corpus |
-| `atrium reingest` | Re-chunk an existing document |
+| `atrium reingest` | Re-chunk an already-ingested document |
 | `atrium demo` | Ingest one document and search it back |
 | `atrium serve` | Run the API |
 | `atrium version` | Print the version |
 
 ---
 
-## Worker
-
-`POST /jobs` needs a worker to drain the queue:
-
-```bash
-python -m atrium.worker
-```
-
-Workers claim jobs atomically, so several can share one queue file
-without processing a document twice. The queue is a single SQLite
-file (`JOB_DB_PATH`); to run workers on other hosts, put it on a
-shared volume.
-
----
-
-## Docker
-
-```bash
-docker build -t atrium-rag .
-docker run -p 8000:8000 --env-file .env atrium-rag
-
-# or the whole stack (API + worker + Qdrant)
-docker compose --profile qdrant up -d
-```
-
-The image runs as a non-root user and carries a health check. Build
-with extras via `--build-arg EXTRAS="ocr,rerank"`.
-
-The Compose stack needs an embedding endpoint on the host — it points
-`EMBED_BASE_URL` at `host.docker.internal:11434`, which is where Ollama
-listens by default. Run `ollama serve` and `ollama pull bge-large`
-first, or point `.env.docker` at whatever endpoint you use.
-
----
-
-## Supported formats
+## Formats
 
 | Format | Parser |
 |---|---|
@@ -371,15 +294,98 @@ first, or point `.env.docker` at whatever endpoint you use.
 | Markdown, TXT, CSV, JSON | built-in |
 | JPG / PNG / WebP | vision adapter (needs Ollama + a vision model) |
 
-The PDF library is a configuration choice, not a dependency of the
-architecture: `atrium/pdf_backend.py` defines a seam over the seven
-primitives the parser needs, and `ATRIUM_PDF_BACKEND` selects the
-implementation. `pdfplumber` is the default; `pymupdf` is faster
-(pdfminer.six is pure Python) and is installed through an extra —
-see [License](#license).
+Parsing is pure Python and heuristic — no model, no API key, no GPU, and
+no licence obligations beyond MIT. The PDF library is a configuration
+choice, not a dependency of the architecture: `pdfplumber` is the
+default, `pymupdf` is faster and is installed through an extra — see
+[License](#license). `atrium-rag[alt-parsers]` adds Docling as an
+alternative PDF parser.
 
-Install `atrium-rag[alt-parsers]` for Docling as an alternative PDF
-parser.
+### Look at what the parser produced
+
+`GET /visualize` renders the chunks of a document you drop into it —
+their type, their page, their heading path. `GET /retrieval_lab` loads
+one document into memory and lets you query it without touching your
+corpus.
+
+![the chunk visualiser: a document dropped in, the chunks it produced](docs/images/visualize.gif)
+
+---
+
+## Benchmark
+
+Retrieval quality is measured against Docling and Unstructured on a
+corpus of 29 documents — academic papers, government reports, forms,
+scanned pages, CJK and Arabic — with 700 questions across five
+difficulty tiers. Each system parses and chunks with its own pipeline
+and embeds with the same model.
+
+On the 23 documents that carry a question set:
+
+| system | R@5 | R@10 | MRR | parse time | peak RSS |
+|---|---|---|---|---|---|
+| **atrium** | **0.700** | **0.769** | **0.574** | 88 s | 1016 MB |
+| docling | 0.686 | 0.726 | 0.540 | 554 s | 3482 MB |
+| unstructured | 0.614 | 0.688 | 0.486 | 195 s | 855 MB |
+
+*pdfplumber · structure-aware chunking · bge-large · dense retrieval
+fused with BM25 (RRF) · reranker off · 23 documents · 700 questions.*
+
+The difference against Docling is inside the confidence interval; the
+separation is in cost — atrium parses the corpus in a sixth of the time
+and a third of the memory.
+
+`POST /search` answers with **dense retrieval** today: the same corpus,
+the same embedding model, **0.655 R@5**. The 0.700 above is the same
+system with the sparse ranker fused in, which is the configuration the
+benchmark measured and the one the corpus endpoint is being moved to.
+
+The harness, the corpus and the exact commands are published in the
+[`atrium-benchmarks`](https://github.com/yash-0503/atrium-benchmarks)
+repository, so the numbers can be reproduced. See
+`docs/benchmark/final_result.md` there for the intervals, the per-tier
+breakdown and the failure attribution.
+
+---
+
+## Known limits
+
+Worth knowing before you rely on it:
+
+- **Two-column papers parse worse than single-column ones.** The
+  columns interleave, so a paragraph can pick up half a line from the
+  other column.
+- **Forms lose their labels.** A W-2 or a 1040 keeps its values but
+  not always the field they belong to.
+- **Scanned pages need OCR**, which is off by default. Without it a
+  scanned page comes back empty.
+- **The local store scans every vector on every query.** It is the
+  right tool up to roughly twenty thousand chunks.
+- **Retrieval is dense-only in the corpus endpoint.** The sparse
+  ranker exists and is measured; it is not wired into `/search` yet.
+- **There is no distributed job queue.** Workers share one SQLite file.
+- **The reranker is opt-in.** It helps most corpora and hurts forms,
+  slides, math and OCR'd scans, so it stays off until you ask for it.
+
+---
+
+## Docker
+
+```bash
+docker build -t atrium-rag .
+docker run -p 8000:8000 --env-file .env atrium-rag
+
+# or the whole stack (API + worker + Qdrant)
+docker compose --profile qdrant up -d
+```
+
+The image runs as a non-root user and carries a health check. Build with
+extras via `--build-arg EXTRAS="ocr,rerank"`.
+
+The Compose stack needs an embedding endpoint on the host — it points
+`EMBED_BASE_URL` at `host.docker.internal:11434`, which is where Ollama
+listens by default. Run `ollama serve` and `ollama pull bge-large`
+first, or point `.env.docker` at whatever endpoint you use.
 
 ---
 
@@ -413,61 +419,13 @@ pip install -e ".[dev]"
 
 pytest tests/ -q
 ruff check atrium tests scripts
-mypy atrium            # advisory for now — see Limitations
 make build             # wheel + sdist, then twine check
 ```
 
 The synthetic parsing fixtures under `tests/parsing_fixtures/` are in
-the repository. A few tests also parse real third-party documents
-(a W-2 form, a 10-K); that corpus is not in this repository, so those
-tests skip rather than pass quietly.
-
----
-
-## Evaluation
-
-Retrieval quality is measured against Docling and Unstructured on a
-corpus of 29 documents — academic papers, government reports, forms,
-scanned pages, CJK and Arabic — with 700 questions across five
-difficulty tiers. Each system parses and chunks with its own pipeline
-and embeds with the same model, so the comparison isolates the part
-that is usually bought off the shelf.
-
-The numbers are in [Why](#why), above. Two caveats belong with them:
-
-- The hard, implicit and unanswerable tiers are machine-drafted and
-  queued for human sign-off; `python -m eval_v2.review_cli status`
-  reports how many are still open, and the harness prints that count on
-  every run. The published numbers come from a run in which those
-  questions were still open, so read them as provisional.
-- Two document types are known weak spots: two-column academic papers
-  and government forms. The harness reports per-document coverage, so
-  the gap is visible rather than averaged away.
-
-The harness, the corpus and the exact commands are published in the
-`atrium-benchmarks` repository, so the numbers can be reproduced. See
-`docs/benchmark/final_result.md` there for the intervals, the per-tier
-breakdown and the failure attribution.
-
----
-
-## Limitations
-
-- **The sparse ranker is not reachable.** BM25 and the confidence gate
-  that fuses it are in the library, but no endpoint or command passes
-  them a sparse index, so retrieval is dense (+ an optional rerank).
-- **OCR on a noisy scan is weak.** The OCR path returns an empty string
-  for a page it cannot read; the count of unreadable pages is reported
-  on the job row, but the text is not recovered.
-- **CJK / Arabic BM25** tokenization is not script-aware yet.
-- **No distributed job queue** — workers share a SQLite file. There is
-  no Redis / Kafka / Celery and no Postgres job store.
-- **The local store is a file, not a search engine.** Its query scans
-  every stored vector; past roughly twenty thousand chunks it is the
-  wrong tool (see *Vector stores*).
-- **mypy is advisory.** ~30 pre-existing `Optional`-narrowing findings,
-  mostly in the PDF parser's geometry helpers.
-- **`/visualize`** loads Tailwind from a CDN; there is no offline build.
+the repository. A few tests also parse real third-party documents (a W-2
+form, a 10-K); that corpus is not in this repository, so those tests
+skip rather than pass quietly.
 
 ---
 
@@ -491,5 +449,5 @@ pip install "atrium-rag[fast-pdf]"
 ATRIUM_PDF_BACKEND=pymupdf
 ```
 
-Atrium itself is MIT under both settings; the AGPL covers PyMuPDF,
-which is yours to choose.
+Atrium itself is MIT under both settings; the AGPL covers PyMuPDF, which
+is yours to choose.
