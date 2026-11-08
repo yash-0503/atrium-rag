@@ -45,6 +45,28 @@ class ChunkRecord(BaseModel):
     # Qdrant/PG payload alongside the text, so it survives a restart.
     chunking_strategy: str = ""
 
+
+def source_fields(payload: dict) -> tuple:
+    """The page number and the heading path of a stored chunk.
+
+    `ChunkRecord` keeps them in `SourceMetadata`, so in the persisted
+    payload they sit under `source` — not at the top level. Every
+    adapter used to read them from the top level, which returned
+    `None` and `[]`: the key was there, the value was not, and every
+    hit looked like it came from a page nobody could cite.
+
+    Both levels are accepted, so a payload written by an older build
+    (or by hand) still reads correctly.
+    """
+    source = payload.get("source") or {}
+    page = source.get("page_number")
+    if page is None:
+        page = payload.get("page_number")
+    section = source.get("section_path")
+    if section is None:
+        section = payload.get("section_path")
+    return page, list(section or [])
+
 class JobStatus(BaseModel):
     job_id: str
     status: Literal["pending", "running", "complete", "failed"]

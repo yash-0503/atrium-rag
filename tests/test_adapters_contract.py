@@ -300,7 +300,11 @@ class TestSqliteAdapterContract:
             "text": "hello",
             "embedding": [1.0, 0.0, 0.0],
             "element_type": "paragraph",
-            "source": SourceMetadata(file_name="a.pdf", page_number=1),
+            "source": SourceMetadata(
+                file_name="a.pdf",
+                page_number=1,
+                section_path=["Introduction", "Retention"],
+            ),
             "char_span": (0, 5),
             "content_hash": "h",
         }
@@ -341,6 +345,36 @@ class TestSqliteAdapterContract:
         assert hit["text"] == "hello"
         assert hit["doc_id"] == "doc1"
         assert hit["score"] == pytest.approx(1.0, abs=1e-6)
+
+    def test_search_returns_the_page_and_the_heading_path(self, tmp_path):
+        """The provenance has to survive the round trip.
+
+        `ChunkRecord` keeps the page and the heading path inside
+        `SourceMetadata`, so in the persisted payload they sit under
+        `source`. Every adapter used to read them from the top level:
+        the key was present in the hit and the value was `None`, so
+        every result looked like it came from a page nobody could
+        cite. Assert the value, not the key — the key-only assertion
+        is what let this through.
+        """
+        store = self._store(tmp_path)
+        store.ensure_collection("documents", 3)
+        store.upsert([self._record()])
+        hit = store.search([1.0, 0.0, 0.0], top_k=5)[0]
+        assert hit["page_number"] == 1
+        assert hit["section_path"] == ["Introduction", "Retention"]
+
+    def test_retrieve_parents_returns_the_page_and_the_heading_path(self, tmp_path):
+        """The same two fields, on the parent path."""
+        store = self._store(tmp_path)
+        store.ensure_collection("documents", 3)
+        store.upsert([self._record(chunk_id="parent", is_parent=True)])
+        parents = store.retrieve_parents(["parent"])
+        assert parents["parent"]["page_number"] == 1
+        assert parents["parent"]["section_path"] == [
+            "Introduction",
+            "Retention",
+        ]
 
     def test_search_orders_by_score(self, tmp_path):
         store = self._store(tmp_path)

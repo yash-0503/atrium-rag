@@ -14,7 +14,7 @@ from typing import Any, Dict, List, Optional, Protocol
 
 from tenacity import retry, stop_after_attempt, wait_exponential
 
-from atrium.models import ChunkRecord
+from atrium.models import ChunkRecord, source_fields
 
 # The vector-store client libraries are imported *inside* the adapter
 # that uses them, not here at module scope.
@@ -36,8 +36,8 @@ from atrium.models import ChunkRecord
 
 
 def __getattr__(name: str):
-    """Resolve the heavy vector-DB client classes on first access
-    (PEP 562). Keeps them out of the import path without removing
+    """Resolve the heavy vector-DB client classes on first access.
+       Keeps them out of the import path without removing
     them from the module's public surface."""
     if name == "QdrantClient":
         from qdrant_client import QdrantClient
@@ -135,12 +135,6 @@ class VectorDBAdapter(Protocol):
     def count_chunks(self) -> int: ...
     def close(self) -> None: ...
     def health(self) -> bool: ...
-    # Task B (2026-10-10): retrieval protocol shared by atrium.retrieval.
-    # Adapters must implement all four for `retrieve_and_rerank` to
-    # exercise the unified v1 path; collection_schema_version returning
-    # 0 + missing search_children keeps the helper on the legacy v0
-    # branch, but tests/test_adapters_contract.py asserts the full
-    # surface (Qdrant: 14 tests, PgVector: 2 tests, both backends).
     def collection_schema_version(self) -> int: ...
     def search(
         self,
@@ -411,7 +405,7 @@ class QdrantAdapter:
         except Exception: return False
 
     # ------------------------------------------------------------------
-    # Retrieval protocol (Task B, 2026-10-10). Mirror the shape used by
+    # Retrieval protocol. Mirror the shape used by
     # the benchmark harness's _BenchQdrant + _BenchHelperDB so the
     # production adapter is drop-in for atrium.retrieval.retrieve_and_rerank.
     # ------------------------------------------------------------------
@@ -423,14 +417,15 @@ class QdrantAdapter:
         points (which never had those fields in their payload) flow
         through `search()` without TypeError downstream."""
         payload = h.payload or {}
+        page_number, section_path = source_fields(payload)
         return {
             "id": str(h.id),
             "score": float(h.score or 0.0),
             "text": payload.get("text", ""),
             "doc_id": payload.get("doc_id", ""),
             "chunk_id": payload.get("chunk_id", str(h.id)),
-            "page_number": payload.get("page_number"),
-            "section_path": payload.get("section_path") or [],
+            "page_number": page_number,
+            "section_path": section_path,
             "element_type": payload.get("element_type", ""),
             "is_parent": bool(payload.get("is_parent", False)),
             "parent_id": payload.get("parent_id"),
@@ -518,10 +513,11 @@ class QdrantAdapter:
         for p in points:
             payload = p.payload or {}
             key = str(payload.get("chunk_id") or p.id)
+            page_number, section_path = source_fields(payload)
             out[key] = {
                 "text": payload.get("text", ""),
-                "page_number": payload.get("page_number"),
-                "section_path": payload.get("section_path") or [],
+                "page_number": page_number,
+                "section_path": section_path,
                 "element_type": payload.get("element_type", ""),
             }
         return out
@@ -670,14 +666,15 @@ class PgVectorAdapter:
         shape. `chunk_id` is the UUID primary key; `id` mirrors it
         so callers can use either interchangeably."""
         payload = payload or {}
+        page_number, section_path = source_fields(payload)
         return {
             "id": str(chunk_id),
             "score": float(score),
             "text": payload.get("text", ""),
             "doc_id": doc_id or "",
             "chunk_id": str(chunk_id),
-            "page_number": payload.get("page_number"),
-            "section_path": payload.get("section_path") or [],
+            "page_number": page_number,
+            "section_path": section_path,
             "element_type": payload.get("element_type", ""),
             "is_parent": bool(payload.get("is_parent", False)),
             "parent_id": payload.get("parent_id"),
@@ -791,10 +788,11 @@ class PgVectorAdapter:
         for chunk_id, payload in rows:
             if payload is None:
                 payload = {}
+            page_number, section_path = source_fields(payload)
             out[str(chunk_id)] = {
                 "text": payload.get("text", ""),
-                "page_number": payload.get("page_number"),
-                "section_path": payload.get("section_path") or [],
+                "page_number": page_number,
+                "section_path": section_path,
                 "element_type": payload.get("element_type", ""),
             }
         return out

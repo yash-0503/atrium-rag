@@ -506,10 +506,15 @@ async def search(body: SearchRequest):
     """Search the ingested corpus.
 
     This is the corpus-level retrieval endpoint — the HTTP counterpart
-    of ``atrium search``. It embeds the query and then runs the same
-    ``atrium.retrieval.retrieve_and_rerank`` pipeline the benchmark
-    harness uses: wide candidate fetch → optional cross-encoder rerank
-    → parent dedup → parent resolution.
+    of ``atrium search``. It embeds the query and then runs
+    ``atrium.retrieval.retrieve_and_rerank``: wide candidate fetch →
+    optional cross-encoder rerank → parent dedup → parent resolution.
+
+    The benchmark harness runs its own retrieval implementation
+    (``eval_v2/retrieval/pipeline.py``), not this one — the two share
+    the BM25 index and the rerank adapter, not the pipeline. So a
+    benchmark number is a statement about a retrieval configuration,
+    and the configuration is printed with the number.
 
     ``/retrieval_lab/search`` is deliberately a *different* thing: it
     scores against an in-RAM cosine matrix for a single uploaded

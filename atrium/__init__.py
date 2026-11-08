@@ -1,11 +1,11 @@
 """
-atrium — Universal RAG ingestion engine.
+atrium — RAG ingestion engine.
 
 A FastAPI-based document ingestion service that parses, chunks, embeds,
 and stores PDFs, Office documents, HTML, Markdown, and more into a
 vector database (Qdrant or pgvector). Retrieval is via a unified
 helper that supports optional reranking, parent-child chunking, and
-hybrid (vector + BM25) fusion.
+Dense retrieval.
 
 Quickstart::
 

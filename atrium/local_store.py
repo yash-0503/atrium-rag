@@ -25,6 +25,8 @@ import threading
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Sequence
 
+from .models import source_fields
+
 __all__ = ["SqliteAdapter"]
 
 _SCHEMA = """
@@ -343,14 +345,15 @@ class SqliteAdapter:
             score = float(scores[position])
             if score_threshold is not None and score < float(score_threshold):
                 continue
+            page_number, section_path = source_fields(payload)
             scored.append({
                 "id": row["chunk_id"],
                 "score": float(score),
                 "text": row["text"] or "",
                 "doc_id": row["doc_id"] or "",
                 "chunk_id": payload.get("chunk_id", row["chunk_id"]),
-                "page_number": payload.get("page_number"),
-                "section_path": payload.get("section_path") or [],
+                "page_number": page_number,
+                "section_path": section_path,
                 "element_type": payload.get("element_type", ""),
                 "is_parent": bool(payload.get("is_parent", False)),
                 "parent_id": payload.get("parent_id"),
@@ -375,13 +378,14 @@ class SqliteAdapter:
         parents: Dict[str, Dict[str, Any]] = {}
         for row in rows:
             payload = json.loads(row["payload"] or "{}")
+            page_number, section_path = source_fields(payload)
             parents[row["chunk_id"]] = {
                 "id": row["chunk_id"],
                 "text": payload.get("text", ""),
                 "doc_id": payload.get("doc_id", ""),
                 "chunk_id": row["chunk_id"],
-                "page_number": payload.get("page_number"),
-                "section_path": payload.get("section_path") or [],
+                "page_number": page_number,
+                "section_path": section_path,
                 "element_type": payload.get("element_type", ""),
                 "is_parent": True,
                 "parent_id": payload.get("parent_id"),

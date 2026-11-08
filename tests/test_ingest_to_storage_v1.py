@@ -632,3 +632,72 @@ class TestEmbedderConfigConsistency:
         # Just check the worker doesn't have its own hardcoded defaults.
         assert 'model="nomic-embed-text:v1.5"' not in worker_src
         assert "dim=768" not in worker_src
+
+
+# ---------------------------------------------------------------------------
+# Provenance round trip.
+#
+# `ChunkRecord` keeps the page number and the heading path inside
+# `SourceMetadata`, so in the persisted payload they live under
+# `source`. Every adapter used to read them from the top level of the
+# payload: the key was in the hit, the value was `None`, and every
+# result looked like it came from a page nobody could cite — in the
+# API, in the CLI, in the store the default install uses.
+#
+# These tests assert the value, through the real store, because the
+# key-only assertion is what let it through.
+# ---------------------------------------------------------------------------
+
+
+class TestProvenanceRoundTrip:
+    def test_the_local_store_returns_the_page_and_the_heading_path(self, tmp_path):
+        from atrium.local_store import SqliteAdapter
+
+        store = SqliteAdapter(path=str(tmp_path / "atrium_local.db"))
+        store.ensure_collection("documents", dim=4)
+        store.upsert([_make_v0_record(text="a chunk from page 7")])
+
+        hits = store.search([0.0, 0.0, 0.0, 0.0], top_k=5)
+        assert len(hits) == 1
+        assert hits[0]["page_number"] == 1
+        assert hits[0]["section_path"] == ["H1"]
+
+    def test_the_local_store_returns_the_parents_page_and_heading_path(self, tmp_path):
+        from atrium.local_store import SqliteAdapter
+
+        store = SqliteAdapter(path=str(tmp_path / "atrium_local.db"))
+        store.ensure_collection("documents", dim=4)
+        parent_id = _uuid_str()
+        store.upsert([
+            _make_v1_record(chunk_id=parent_id, is_parent=True, child_ids=["c"]),
+        ])
+
+        parents = store.retrieve_parents([parent_id])
+        assert parents[parent_id]["page_number"] == 1
+        assert parents[parent_id]["section_path"] == ["H1"]
+
+    def test_qdrant_returns_the_page_and_the_heading_path(self):
+        adapter = _make_inmem_qdrant_adapter()
+        adapter.ensure_collection("documents", dim=4)
+        adapter.upsert([_make_v0_record(text="a chunk from page 7")])
+
+        hits = adapter.search([0.0, 0.0, 0.0, 0.0], top_k=5)
+        assert len(hits) == 1
+        assert hits[0]["page_number"] == 1
+        assert hits[0]["section_path"] == ["H1"]
+
+    def test_the_hit_carries_the_provenance_through_the_retrieval_helper(self, tmp_path):
+        """The whole chain, through the function the API calls."""
+        from atrium.local_store import SqliteAdapter
+        from atrium.retrieval import retrieve_and_rerank
+
+        store = SqliteAdapter(path=str(tmp_path / "atrium_local.db"))
+        store.ensure_collection("documents", dim=4)
+        store.upsert([_make_v0_record(text="a chunk from page 7")])
+
+        hits = retrieve_and_rerank(
+            store, [0.0, 0.0, 0.0, 0.0], "a chunk", top_k=3,
+        )
+        assert len(hits) == 1
+        assert hits[0]["page_number"] == 1
+        assert hits[0]["section_path"] == ["H1"]
