@@ -8,8 +8,8 @@ Use **GitHub's private vulnerability reporting**:
 <https://github.com/yash-0503/atrium-rag/security/advisories/new>
 
 (That link works once *Settings -> Security -> Private vulnerability
-reporting* is enabled on the repository. If it is not, email the
-maintainer directly — the address is in the repository's `README`.)
+reporting* is enabled on the repository. If it is not, email
+`security@atrium-rag.space` directly.)
 
 Include:
 
