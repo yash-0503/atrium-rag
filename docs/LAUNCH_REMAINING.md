@@ -12,7 +12,7 @@ done; what is left is execution.
 | | done | left |
 |---|---|---|
 | **The library** | ✅ 299 tests pass, ruff clean, twine passes, on PyPI, repo public | the hybrid retrieval work |
-| **The site** | ✅ live on Vercel, SEO complete (sitemap, robots, JSON-LD, llms.txt), analytics installed, waitlist modal | the domain, the two env vars, the push |
+| **The site** | ✅ live on Vercel, SEO complete (sitemap, robots, JSON-LD, llms.txt), analytics installed, waitlist modal, security headers | `NEXT_PUBLIC_SITE_URL`, the Resend env vars, the push |
 | **The content** | ✅ README rewritten, 12 issues written, GIF recorded, benchmark config printed | the launch posts, the reel, the benchmark page |
 | **The marketing** | — | everything |
 
@@ -147,28 +147,44 @@ Cloudflare Registrar includes Cloudflare DNS.
 
 ---
 
-## 4. The Buttondown template
+## 4. The email setup
 
-The waitlist route talks to Buttondown's API
-(`POST https://api.buttondown.email/v1/subscribers`) with
-`{email_address, type: "regular"}`. So:
+**The waitlist now stores addresses in Resend**, not Buttondown, and
+the confirmation is sent from your own domain. The route's decision
+tree is Resend → Buttondown → Formspree → a local file → a 503 that
+says so.
 
-**In Buttondown:**
-1. Create the account at <https://buttondown.email> (free up to 100
-   subscribers).
-2. **Settings → API keys → Generate API key.** Copy it — this is the
-   `BUTTONDOWN_API_KEY`.
-3. **Emails → New email → Start from scratch.**
-   - **Subject:** `Atrium — you're on the list`
-   - **Preview text:** `Atrium is MIT licensed and free to run yourself. This list is for the hosted version.`
-   - **Body:** see below.
-   - **Type:** Regular (not confirmation). Buttondown's double opt-in
-     would mean a second email before you get the address into your
-     list — for a waitlist you want the address immediately.
-4. **Settings → Embed → "Form action"** — copy it. That is the form
-   URL for the hosted version.
-5. **Settings → Subscribe settings** → tick "Require subscribers to
-   confirm" **off** (see above).
+**In Resend:**
+1. **Domains → Add Domain** → `atrium-rag.space` → region `us-east-1`.
+2. Add the records it gives you at Vercel DNS (four of them — the
+   full table is in `DOMAIN_AND_EMAIL.md` §2.3). The **Auto Configure**
+   button writes them for you if you would rather. **Strip the domain
+   suffix from the Name field** — `send`, not `send.atrium-rag.space`.
+3. **Segments → New** → name it `waitlist` → copy the uuid.
+4. **API Keys → Create** → copy the key.
+5. In Vercel: `RESEND_API_KEY`, `RESEND_SEGMENT_ID`,
+   `RESEND_FROM=Atrium <hello@atrium-rag.space>`.
+
+The confirmation email is written in the route — `welcomeEmail` in
+`src/app/api/waitlist/route.ts`. Plain HTML, no template, no tracking.
+Edit it there.
+
+**Buttondown is now the fallback, not the plan**, and it is worth
+keeping for one reason: **Resend's broadcast send is metered
+separately, at about $40/month for 5,000 contacts.** Buttondown's free
+tier covers a list under a hundred subscribers and its $9/month tier is
+cheaper than that. So when there is news to send to the list, use
+Buttondown; use Resend for the transactional mail.
+
+If you set up Buttondown as well, its shape is:
+`POST https://api.buttondown.email/v1/subscribers` with
+`{email_address, type: "regular"}`, and the key comes from **Settings
+→ API keys → Generate API key**. In the dashboard: **Emails → New
+email → Start from scratch**, subject *"Atrium — you're on the list"*,
+type **Regular** (not confirmation — double opt-in means a second
+email before the address reaches your list, and for a waitlist you want
+it immediately), and the body below.
+
 
 ### The email template
 
@@ -465,7 +481,7 @@ cannot answer it retroactively.
 3. **2–3** — buy `atrium-rag.com`, point the apex, 301 `www` and the
    old vercel.app URL, DNSSEC, security headers, Search Console.
    (1 hour.)
-4. **4** — the Buttondown template and the API key. (20 min.)
+4. **4** — the Resend domain, the segment, the three env vars. (30 min.)
 5. **5.3** — record the terminal GIF. (30 min.)
 6. **6.2–6.3** — cut the reel from the GIFs. (2 hours.)
 7. **6.4** — the posts, starting with HN on day 1.
