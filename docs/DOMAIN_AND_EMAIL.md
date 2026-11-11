@@ -67,9 +67,24 @@ You want two different things, and they have different answers.
 
 ### 2.1 Sending from the domain — Resend (this is what the waitlist uses)
 
-Resend sends the welcome email and, later, the broadcast to the list.
-It puts **no branding in the email body on any plan** — that is why it
-replaced Buttondown.
+Resend sends the welcome email. It puts **no branding in the email
+body on any plan** — that is why it replaced Buttondown.
+
+One correction to the plan this replaces: Resend's *broadcast* (bulk
+marketing) send is **metered separately** from its transactional tier —
+roughly **$40/month for 5,000 contacts**, and it is not included in the
+$20 transactional plan. So the list lives in Resend's contacts, and the
+email you send when there is news is a separate decision:
+
+- **Under about 100 subscribers — Buttondown's free tier.** Custom
+  domain sending, no size limit on the branding at that size, and it
+  has an export.
+- **Past that — Buttondown at $9/month** is cheaper and better than
+  Resend's marketing tier for a list this size.
+
+Resend remains the right tool for the transactional half: the
+confirmation, and any "your document finished processing" style mail.
+Two providers, two jobs.
 
 **Setup, once:**
 
@@ -111,42 +126,98 @@ Start at `p=none`. Move to `quarantine` only after a week of clean
 passes. This is what stops someone spoofing your domain in a "re: your
 Atrium waitlist" email.
 
-**Resend's free tier:** 3,000 transactional emails a month, 100 a day
-(UTC, resets at midnight), 1,000 contacts a month for broadcasts, 3
-verified domains, 10 requests a second. For a waitlist that is
-generous. Note the 100/day cap — if the site ever gets scraped, the
-route's own 5-per-10-minutes-per-IP throttle is what protects you.
+**Resend's free tier:** 3,000 transactional emails a month, a hard cap
+of **100 a day** (UTC, resets at midnight), 3 verified domains, 10
+requests a second, no credit card. For a waitlist that is generous.
+Note the 100/day cap — if the site ever gets scraped, the route's own
+5-per-10-minutes-per-IP throttle is what protects you.
 
 ### 2.2 Receiving — an address you can read
 
 This is a different problem, and it needs a different service: one
 that *receives* mail and puts it in an inbox.
 
-**The simplest option that needs no DNS change: forward to your Gmail.**
+**Every option below works with Vercel DNS.** You add MX/TXT/CNAME
+records at Vercel; nothing moves. The one exception is Cloudflare
+Email Routing, which is explained at the bottom — and it is the option
+you should not use.
 
-- **Forward Email** (~$3/year for a single domain alias) — add an MX
-  record and a TXT SPF record in Vercel DNS, and mail to
-  `hello@atrium-rag.space` lands in your Gmail. It is forwarding
-  only: you can read and reply, but the reply comes from your Gmail.
-  Perfect for a `hello@` address on a project page.
-- **Cloudflare Email Routing** — free, and it works with *any* MX
-  provider, but it needs Cloudflare to be the DNS host. Using it means
-  moving the nameservers off Vercel, which would mean moving the
-  domain's DNS off Vercel too (the records are all there, it is a
-  copy-paste, but it is work). It also cannot send — replying from
-  the alias is not supported.
-- **Zoho Mail free tier** — a real mailbox with IMAP, but the free
-  tier is limited to a few users on one domain and it wants its own
-  MX records.
-- **Google Workspace** — a real mailbox with the best mail client, but
-  it starts around $7/user/month and there is no free tier for a
-  custom domain.
+| Service | Cost | A real mailbox? | IMAP | Send/reply from the domain? |
+|---|---|---|---|---|
+| **Purelymail** | **$10/year**, no per-user fee | yes | yes | yes |
+| Zoho Mail Free | free | yes — webmail only | **no** | yes |
+| Zoho Mail Lite | $1/user/month | yes | yes | yes |
+| Forward Email (Enhanced) | $3/month | yes | yes | yes |
+| Forward Email (free) | free | no — forwarding only | no | **no** |
+| Google Workspace Starter | $7/user/month | yes | yes | yes |
+| Proton Mail Plus | ~$2.49/month | yes | yes | yes |
+| Fastmail Standard | $5–6/month | yes | yes | yes |
 
-**My recommendation: Forward Email, and point `hello@` at your Gmail.**
-It is the smallest thing that gives a human-readable address on your own
-domain, it needs only two DNS records, and it costs almost nothing. If
-you later want a full mailbox, move to Zoho or Google Workspace then —
-nothing else about the setup depends on which one you chose.
+**My recommendation: Purelymail, $10 a year.** It is the cheapest
+thing on that list that gives a real mailbox with IMAP and SMTP on
+your own domain, it has no per-seat pricing, and it needs three DNS
+records at Vercel.
+
+Two things to know before choosing:
+
+- **Zoho's free tier is webmail-only.** No IMAP, no POP, no
+  ActiveSync — you would read and reply in a browser, and on an iPhone
+  you would not read it at all. It is also only available on the US,
+  IN and EU data centres.
+- **Forward Email's free tier is forwarding only.** You read the mail
+  in Gmail but you cannot reply *as* `hello@` — the reply comes from
+  your Gmail address. For a `hello@` on a project page that is usually
+  fine. It is $3/month if you want to send from the alias.
+
+**Cloudflare Email Routing is not an option here.** It is free and it
+is the obvious choice, but it requires the domain to be an *active
+Cloudflare DNS zone* — Cloudflare's own documentation says so
+explicitly, twice. Using it means moving the nameservers off Vercel at
+Name.com and re-creating the Vercel records inside Cloudflare, and it
+still cannot send mail. Not worth it.
+
+### 2.3 The six DNS records, all at Vercel
+
+Both senders, one panel:
+
+| # | Name | Type | Value | Purpose |
+|---|---|---|---|---|
+| 1 | `send` | MX | `feedback-smtp.us-east-1.amazonses.com` (from Resend) | Resend Return-Path |
+| 2 | `send` | TXT | `v=spf1 include:amazonses.com ~all` (from Resend) | Resend SPF |
+| 3 | `resend._domainkey` | TXT | `p=...` (from Resend) | Resend DKIM |
+| 4 | *(blank)* | MX | the host from the Purelymail dashboard | mailbox inbound |
+| 5 | *(blank)* | TXT | the SPF value from the Purelymail dashboard | mailbox SPF |
+| 6 | `purelymail1._domainkey` | CNAME | `key1.dkimroot.purelymail.com` | mailbox DKIM |
+
+Plus `_dmarc` TXT once SPF and DKIM pass:
+`v=DMARC1; p=none; rua=mailto:dmarc@atrium-rag.space`
+
+**The SPF subtlety that breaks things.** Vercel allows only **one**
+SPF record per name; a second `v=spf1` at the same name is a
+`permerror` at the receiver, and it is the most-reported cause of
+Resend-on-Vercel verification failing.
+
+You are fine as written above: Resend's SPF is on `send.` and
+Purelymail's is on the apex — two different names, so they never
+collide. But if you ever send transactional mail *from the apex*
+(`welcome@atrium-rag.space` as the From) **and** Purelymail's
+Return-Path is also on the apex, you must merge them into one record:
+
+```
+v=spf1 include:<your-purelymail-spf> include:amazonses.com ~all
+```
+
+**Two Vercel-specific gotchas:**
+
+- **Strip the domain suffix from the Name field.** Type `send`, not
+  `send.atrium-rag.space`. Type `resend._domainkey`, not
+  `resend._domainkey.atrium-rag.space`. This is the number-one cause
+  of a failed verification.
+- **Vercel's default TTL is 60 seconds** and a change can take up to
+  24 hours to settle everywhere. Resend also offers an
+  **Auto Configure** button that writes the records into Vercel DNS
+  for you through an OAuth connection — worth using instead of typing
+  them.
 
 **The addresses to set up:**
 
