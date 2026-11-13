@@ -48,8 +48,6 @@ smoke:
 
 # Regenerate docs/images/benchmark.png from the published run's raw
 # JSON. The README image must stay in step with the data behind it.
-shot:
-	$(VENV)/bin/python scripts/render_benchmark_shot.py
 
 docker:
 	docker build -t atrium-rag .
