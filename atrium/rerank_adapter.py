@@ -178,6 +178,8 @@ class LocalBgeReranker:
         # CrossEncoder handles it internally.
         pairs = [(query, c.text) for c in candidates]
         try:
+            if self._model is None:
+                raise RuntimeError("Reranker model is not initialized")
             raw_scores = self._model.predict(
                 pairs,
                 show_progress_bar=False,
@@ -305,6 +307,8 @@ class FlashRankReranker:
         # reranker's output back to the original RerankCandidate list.
         passages = [{"id": c.id, "text": c.text or ""} for c in candidates]
         try:
+            if self._ranker is None:
+                raise RuntimeError("Reranker is not initialized")
             ranked_passages = self._ranker.rerank(
                 RerankRequest(query=query, passages=passages),
             )
@@ -387,6 +391,8 @@ class CohereReranker:
 
     def _rerank_sdk(self, query, candidates, top_k) -> list[RerankCandidate]:
         try:
+            if self._client is None:
+                raise RuntimeError("client is not initialized")
             response = self._client.rerank(
                 model=self.model,
                 query=query,
