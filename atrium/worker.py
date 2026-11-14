@@ -113,7 +113,7 @@ def _build_parser_and_ocr():
             ocr_adapter = None
 
     parser = UniversalParser(vision_adapter=vision, ocr_adapter=ocr_adapter)
-    return parser, ocr_adapter
+    return parser, vision, ocr_adapter
 
 
 def _build_embedder():
@@ -142,16 +142,18 @@ def _build_job_store():
     return JobStore(db_path=str(data_path("JOB_DB_PATH", "jobs.db")))
 
 
-def _build_parser_for_call(global_parser, ocr_adapter, ocr_override):
+def _build_parser_for_call(global_parser, vision, ocr_adapter, ocr_override):
     # Swap in a sibling parser when the payload specifies per-job OCR.
     if ocr_override is None:
         return global_parser
+    if ocr_override and ocr_adapter is None:
+        log.warning("ocr_override=True but no OCR adapter is available "
+                    "(OCR_ENABLED off or init failed); processing without OCR")
     chosen = ocr_adapter if ocr_override else None
     return UniversalParser(
-        vision_adapter=global_parser.vision_adapter,
+        vision_adapter=vision,
         ocr_adapter=chosen,
     )
-
 
 
 def _arm_job_timeout() -> None:
@@ -183,7 +185,7 @@ def _disarm_job_timeout() -> None:
         pass
 
 
-def _process_one(job: dict, parser, ocr_adapter, embedder, db, job_store) -> None:
+def _process_one(job: dict, parser, vision, ocr_adapter, embedder, db, job_store) -> None:
     """Run one claimed job end-to-end. Updates job status on success/failure.
     The job is already status='running' (set by claim_next)."""
     job_id = job["job_id"]
@@ -209,7 +211,15 @@ def _process_one(job: dict, parser, ocr_adapter, embedder, db, job_store) -> Non
     chunking_mode = payload.get("chunking_mode", "auto")
     chunking_config = payload.get("chunking_config")
 
-    parser_for_this_call = _build_parser_for_call(parser, ocr_adapter, ocr_override)
+    try:
+        parser_for_this_call = _build_parser_for_call(parser, vision, ocr_adapter, ocr_override)
+    except Exception as exc:
+        log.error(
+            "job %s: failed to build parser for call (%s: %s)\n%s",
+            job_id, type(exc).__name__, exc, traceback.format_exc(),
+        )
+        job_store.update(job_id, status="failed", error=f"{type(exc).__name__}: {exc}")
+        return
 
     log.info(
         "job %s: doc_id=%s filename=%s mime=%s ocr=%s chunking_mode=%s",
@@ -248,7 +258,7 @@ def _process_one(job: dict, parser, ocr_adapter, embedder, db, job_store) -> Non
 
 def main() -> int:
     log.info("worker %s starting", WORKER_ID)
-    parser, ocr_adapter = _build_parser_and_ocr()
+    parser, vision, ocr_adapter = _build_parser_and_ocr()
     embedder = _build_embedder()
     db = _build_db()
     job_store = _build_job_store()
@@ -294,7 +304,7 @@ def main() -> int:
 
         # Got a job — reset backoff so the next empty poll reacts fast.
         backoff = POLL_BASE
-        _process_one(job, parser, ocr_adapter, embedder, db, job_store)
+        _process_one(job, parser, vision, ocr_adapter, embedder, db, job_store)
 
         # Housekeeping: the job rows are a record of what happened, but
         # the payloads in them were the user's documents.
