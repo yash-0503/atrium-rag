@@ -1295,7 +1295,7 @@ def reingest(
 
     raw = file_path.read_bytes()
     mime = _detect_mime(raw, file_path.name)
-    with space_status(f"[accent]Re-chunking[/] {file_path.name} → {chunking_mode}"):
+    with space_status(console, f"[accent]Re-chunking[/] {file_path.name} → {chunking_mode}"):
         result = ingest_document(
             doc_id=doc_id,
             file_bytes=raw,

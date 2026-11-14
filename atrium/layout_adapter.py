@@ -134,7 +134,7 @@ class RapidOCRLayoutAdapter:
     def __init__(self, lang: str = "en", text_score: float = 0.5,
                  min_image_strip_px: Optional[int] = None):
         try:
-            from rapidocr_onnxruntime import RapidOCR  # type: ignore
+            from rapidocr_onnxruntime import RapidOCR
         except ImportError as exc:
             raise RuntimeError(
                 "rapidocr-onnxruntime is required. Install with: "

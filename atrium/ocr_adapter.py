@@ -81,7 +81,7 @@ class TesseractOCRAdapter:
     def __init__(self, lang: str = "eng", tesseract_cmd: Optional[str] = None,
                  timeout: float = 30.0):
         try:
-            import pytesseract  # type: ignore
+            import pytesseract
         except ImportError as exc:
             raise RuntimeError(
                 "pytesseract is required for OCR. Install with: "
@@ -197,7 +197,7 @@ class RapidOCRAdapter:
 
     def __init__(self, lang: str = "eng", timeout: float = 30.0):
         try:
-            from rapidocr_onnxruntime import RapidOCR  # type: ignore
+            from rapidocr_onnxruntime import RapidOCR
         except ImportError as exc:
             raise RuntimeError(
                 "rapidocr-onnxruntime is required for OCR_PROVIDER=rapidocr. "

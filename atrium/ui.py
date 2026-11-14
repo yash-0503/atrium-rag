@@ -391,9 +391,9 @@ def _read_key() -> str:
     if os.name == "nt":
         import msvcrt
 
-        ch = msvcrt.getwch()
+        ch = msvcrt.getwch()# type: ignore[attr-defined]
         if ch in ("\x00", "\xe0"):
-            return {"H": "up", "P": "down"}.get(msvcrt.getwch(), "")
+            return {"H": "up", "P": "down"}.get(msvcrt.getwch(), "")# type: ignore[attr-defined]
         if ch in ("\r", "\n"):
             return "enter"
         if ch == "\x03":

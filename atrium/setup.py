@@ -731,7 +731,7 @@ class _Wizard:
         # Pass self.values so in-session dimension edits are preserved
         dim = _dimension_for(model, self.values)
         self.set("EMBED_MODEL", model, "chosen")
-        self.set("EMBED_DIM", dim, "chosen")
+        self.set("EMBED_DIM",str(dim) if dim is not None else "", "chosen")
 
         if needs_key:
             self.set(
