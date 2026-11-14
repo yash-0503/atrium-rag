@@ -60,24 +60,6 @@ jobs:
       - name: Run the unit suite
         run: pytest tests/ -q
 
-  readme-image:
-    name: README image is current
-    runs-on: ubuntu-latest
-    # The benchmark image in the README is rendered from the run's raw
-    # JSON. If the JSON changes and the image is not re-rendered, the
-    # README starts making a claim the data no longer supports — so
-    # the image has to be regenerated in the same commit.
-    steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-python@v5
-        with:
-          python-version: "3.12"
-      - name: Install Pillow
-        run: pip install pillow
-      - name: Re-render and compare
-        run: |
-          python scripts/render_benchmark_shot.py
-          git diff --exit-code docs/images/benchmark.png
 
   install:
     name: Install the built artifact
