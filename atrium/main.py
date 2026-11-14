@@ -338,7 +338,7 @@ async def lifespan(app: FastAPI):
         "job store: %s", data_path("JOB_DB_PATH", "jobs.db"),
     )
     log.info(
-        "vector store: %s (%s)", DB_TYPE, data_path("LOCAL_DB_PATH", "atrium_local.db"),
+               "vector store: %s (%s)", DB_TYPE, env_str("LOCAL_DB_PATH") or "atrium_local.db",
     )
     try:
         _get_db().ensure_collection("documents", embedder.dimension)
