@@ -14,6 +14,7 @@ from typing import Any, Dict, List, Optional, Protocol
 
 from tenacity import retry, stop_after_attempt, wait_exponential
 
+from atrium.config import data_path
 from atrium.models import ChunkRecord, source_fields
 
 # The vector-store client libraries are imported *inside* the adapter
@@ -179,8 +180,7 @@ def build_store(kind: Optional[str] = None) -> VectorDBAdapter:
     name = (kind if kind is not None else env_str("VECTOR_DB") or "sqlite").strip().lower()
     if name in ("sqlite", "local", "file"):
         from atrium.local_store import SqliteAdapter
-
-        return SqliteAdapter(path=env_str("LOCAL_DB_PATH") or "atrium_local.db")
+        return SqliteAdapter(path=str(data_path("LOCAL_DB_PATH","atrium_local.db")))
     if name == "qdrant":
         return QdrantAdapter(
             host=env_str("QDRANT_HOST") or "localhost",
