@@ -85,7 +85,7 @@ def _upload_filename(file: UploadFile) -> str:
 
 
 app = FastAPI(title="Atrium")
-job_store = JobStore(db_path=env_str("JOB_DB_PATH"))
+job_store = JobStore(db_path=str(data_path("JOB_DB_PATH", "jobs.db")))
 # Per-doc concurrency cap for batch ingest. BackgroundTasks fires one
 # task per file and would otherwise allow unbounded parallelism, which
 # on a self-hosted single-host deployment can starve Qdrant/Ollama.
