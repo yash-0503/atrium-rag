@@ -73,6 +73,13 @@ class SqliteAdapter:
         # the cost of a search grew with the corpus *and* was paid in
         # disk reads on every single query.
         self._corpus_cache: Optional[tuple] = None
+        # Which write counter the cached corpus was built from. The API
+        # and the worker are separate processes over one file: a cache
+        # only a process's own writes can invalidate serves a snapshot
+        # the moment the worker ingests anything. `corpus_version` lives
+        # in the database and every write bumps it, so the reader can
+        # see writes it did not make.
+        self._corpus_cache_version: Optional[int] = None
         self._conn: Optional[sqlite3.Connection] = None
 
     # -- connection -----------------------------------------------------
@@ -147,6 +154,26 @@ class SqliteAdapter:
 
     # -- writing --------------------------------------------------------
 
+    def _corpus_version(self) -> int:
+        """The write counter, as the database currently has it.
+
+        One row read per search — cheap next to the reload it guards,
+        and the only way this process can learn that another one wrote
+        to the file.
+        """
+        conn = self._connect()
+        row = conn.execute(
+            "SELECT value FROM meta WHERE key = 'corpus_version'"
+        ).fetchone()
+        return int(row["value"] or 0) if row is not None else 0
+
+    def _bump_corpus_version(self, conn: sqlite3.Connection) -> None:
+        """Advance the counter. Call from inside the write's transaction."""
+        conn.execute(
+            "INSERT INTO meta(key, value) VALUES ('corpus_version', '1') "
+            "ON CONFLICT(key) DO UPDATE SET value = CAST(value AS INTEGER) + 1"
+        )
+
     def upsert(self, chunks: Sequence[Any], batch_size: int = 100) -> None:
         import struct
 
@@ -176,6 +203,7 @@ class SqliteAdapter:
                 " VALUES (?, ?, ?, ?, ?, ?, ?)",
                 rows,
             )
+            self._bump_corpus_version(conn)
             conn.commit()
 
     def delete_stale_chunks(self, doc_id: str, current_run_id: str) -> None:
@@ -186,6 +214,7 @@ class SqliteAdapter:
                 "DELETE FROM chunks WHERE doc_id = ? AND ingest_run_id != ?",
                 (doc_id, current_run_id),
             )
+            self._bump_corpus_version(conn)
             conn.commit()
             self._corpus_cache = None
 
@@ -237,6 +266,7 @@ class SqliteAdapter:
                         " VALUES (?, ?, ?, ?, ?, ?, ?)",
                         rows,
                     )
+                self._bump_corpus_version(conn)
                 conn.execute("COMMIT")
             except Exception:
                 conn.execute("ROLLBACK")
@@ -276,10 +306,14 @@ class SqliteAdapter:
         Returns `(rows, matrix)`, where `matrix` is the float32 array of
         every vector, row-aligned with `rows`.
         """
+        # Read the counter *before* the rows: if a write lands in
+        # between, the cached copy is keyed to an older version and the
+        # next search reloads. Read it after, and the older rows would
+        # be cached under the newer version and never refreshed.
+        version = self._corpus_version()
         cached = self._corpus_cache
-        if cached is not None:
+        if cached is not None and self._corpus_cache_version == version:
             return cached
-
 
         import numpy as np
 
@@ -289,6 +323,7 @@ class SqliteAdapter:
         ).fetchall()
         if not rows:
             self._corpus_cache = ([], np.zeros((0, 0), dtype=np.float32))
+            self._corpus_cache_version = version
             return self._corpus_cache
 
         dim = int(rows[0]["dim"] or 0)
@@ -296,6 +331,7 @@ class SqliteAdapter:
         buffer = b"".join(row["vector"] for row in usable)
         matrix = np.frombuffer(buffer, dtype=np.float32).reshape(len(usable), dim)
         self._corpus_cache = (usable, matrix)
+        self._corpus_cache_version = version
         return self._corpus_cache
 
     def count_chunks(self) -> int:
