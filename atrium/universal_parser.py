@@ -62,6 +62,7 @@ from collections import Counter, defaultdict
 from dataclasses import dataclass, field
 from typing import Optional, Protocol
 
+from .config import env_int
 from .pdf_backend import FLAG_BOLD
 
 # Pillow is imported lazily, inside the function that needs it.
@@ -88,6 +89,30 @@ from .pdf_backend import FLAG_BOLD
 # alone, but it is moved too for symmetry.
 
 log = logging.getLogger("ingest.parser")
+
+
+# Format families that are a zip archive under the hood.
+#
+# Office Open XML (docx/pptx/xlsx), OpenDocument (odt/ods/odp) and EPUB
+# all hand the bytes to a library that decompresses eagerly — python-docx,
+# python-pptx, openpyxl, odfpy and zipfile respectively. `MAX_UPLOAD_BYTES`
+# bounds the *compressed* upload, which is not the number that costs memory:
+# a 10 KB archive may legitimately declare gigabytes of members and pass
+# every upload check before exhausting the process on the first read.
+ZIP_CONTAINER_MIME_TYPES = frozenset({
+    "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+    "application/vnd.openxmlformats-officedocument.presentationml.presentation",
+    "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+    "application/epub+zip",
+    "application/vnd.oasis.opendocument.text",
+    "application/vnd.oasis.opendocument.spreadsheet",
+    "application/vnd.oasis.opendocument.presentation",
+})
+
+# An archive of a million empty members is small, compresses to nothing,
+# and still costs a ZipInfo per member just to enumerate. The byte cap
+# below does not catch that shape, so the member count gets its own bound.
+MAX_ARCHIVE_MEMBERS = 10_000
 
 
 # Data model
@@ -264,6 +289,9 @@ class UniversalParser:
         if ocr is not None and hasattr(ocr, "reset_failures"):
             ocr.reset_failures()
 
+        if mime_type in ZIP_CONTAINER_MIME_TYPES:
+            self._check_archive_expansion(file_bytes, mime_type)
+
         if mime_type == "application/pdf":
             elements = self._safe_parse("PDF", self._parse_pdf, file_bytes)
         elif mime_type == "application/vnd.openxmlformats-officedocument.wordprocessingml.document":
@@ -319,6 +347,52 @@ class UniversalParser:
 
         self._resolve_pending_vision()
         return elements
+
+    def _check_archive_expansion(self, file_bytes: bytes, mime_type: str) -> None:
+        """Reject a zip-container document that expands too far.
+
+        `MAX_UPLOAD_BYTES` measures the compressed request, so it says
+        nothing about the memory a parse will need: deflate reaches
+        roughly 1000:1 on repetitive data, and 10 KB of zeroes expands to
+        about 10 MB while a 10 KB archive of many members declares
+        gigabytes. Every parser for these formats reads members into
+        `bytes` in full, so the process dies on the first oversized
+        member — after the upload was accepted, inside a worker, with no
+        message that points at the file.
+
+        The central directory states every member's uncompressed size, so
+        the whole archive is judged here without decompressing a single
+        byte. This is one level of nesting deep: a bomb hidden inside a
+        member (a zip inside a docx) is the parser library's problem, and
+        this at least guarantees the bytes handed to it are bounded.
+
+        A corrupt archive is left alone — the format parser produces a
+        better message for it than this guard could.
+        """
+        import zipfile
+
+        try:
+            with zipfile.ZipFile(io.BytesIO(file_bytes)) as archive:
+                members = archive.infolist()
+        except (zipfile.BadZipFile, zipfile.LargeZipFile, OSError, EOFError):
+            return
+
+        if len(members) > MAX_ARCHIVE_MEMBERS:
+            raise ValueError(
+                f"{mime_type} archive has {len(members)} members, "
+                f"above the {MAX_ARCHIVE_MEMBERS} limit. This file is not a "
+                "document; it is an archive with a document's extension."
+            )
+
+        declared = sum(member.file_size for member in members)
+        limit = env_int("MAX_DECOMPRESSED_BYTES")
+        if declared > limit:
+            raise ValueError(
+                f"{mime_type} archive expands to {declared} bytes, above "
+                f"MAX_DECOMPRESSED_BYTES={limit}. Raise the limit if the "
+                "document is legitimately that large; otherwise this is a "
+                "decompression bomb and will exhaust memory."
+            )
 
     def _parse_state(self) -> dict:
         """This thread's parse state.
