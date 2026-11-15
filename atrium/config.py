@@ -151,6 +151,12 @@ DEFAULTS: Dict[str, str] = {
     # -- HTTP / security ---------------------------------------------------
     "API_KEY": "",
     "MAX_UPLOAD_BYTES": str(100 * 1024 * 1024),
+    # Ceiling on what a zip-container document (docx/pptx/xlsx/odt/ods/odp/
+    # epub) may expand to once opened. MAX_UPLOAD_BYTES caps the compressed
+    # upload, and deflate reaches ~1000:1, so the two numbers measure
+    # different things: a 10 KB upload can declare gigabytes of members and
+    # take the process out of memory before any parser produces a message.
+    "MAX_DECOMPRESSED_BYTES": str(1024 * 1024 * 1024),
     "ALLOWED_MIME_TYPES": "",
     "ALLOW_CHUNKED_UPLOADS": "0",
     "CORS_ALLOW_ORIGINS": "",
