@@ -3,7 +3,9 @@
   "format": "image/jpeg",
   "_source": "https://upload.wikimedia.org/wikipedia/commons/thumb/3/3a/Cat03.jpg/120px-Cat03.jpg",
   "_license": "CC BY-SA 2.0 (Wikipedia Commons)",
-  "expected_element_types": ["image_caption"],
-  "min_chunks": 1,
-  "_note": "Real 120x120 JPEG of a cat. Tests the raw_image path: with no vision adapter or OCR configured, the parser emits a single placeholder element of type 'image_caption' containing '[Image — no vision or OCR adapter configured]'. With a vision adapter, it would queue a vision call."
+  "expected_element_types": [],
+  "min_chunks": 0,
+  "expect_empty": true,
+  "expect_skipped_reasons": {"no_vision_or_ocr_adapter": 1},
+  "_note": "Real 120x120 JPEG of a cat. Tests the raw_image path: with no vision adapter and no OCR configured the parser emits NOTHING. A placeholder is not content — it used to be embedded and stored like real text, so it came back in the top-k of every unrelated search. The parse is still recorded as skipped with reason 'no_vision_or_ocr_adapter', so the ingest reports '0 pages readable' instead of a clean success. With a vision adapter it would queue a vision call and emit a real caption; with OCR it would emit a paragraph of the transcribed text."
 }

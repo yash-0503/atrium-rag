@@ -26,7 +26,6 @@ from atrium.errors import NoReadableContentError
 from atrium.pipeline import describe_skipped, format_skipped
 from atrium.universal_parser import UniversalParser
 
-
 # A one-pixel JPEG. Nothing can read it without an OCR or vision
 # adapter, which is the point: the parse has to drop it and say so.
 _JPEG = bytes.fromhex(
@@ -165,8 +164,8 @@ class TestTheIngest:
         and forty typed ones is a document that was ingested.
         """
         from atrium.local_store import SqliteAdapter
-        from atrium.universal_parser import ParsedElement
         from atrium.pipeline import ingest_document
+        from atrium.universal_parser import ParsedElement
 
         class _MixedParser:
             """A document that is mostly readable, with some pages that
