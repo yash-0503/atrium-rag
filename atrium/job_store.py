@@ -75,6 +75,8 @@ _UPDATABLE_COLUMNS = frozenset({
     "claimed_by",
     "claimed_at",
     "payload",
+    "skipped_elements",
+    "skipped_reasons",
 })
 
 
@@ -116,7 +118,9 @@ class JobStore:
                 claimed_by    TEXT,
                 claimed_at    REAL,
                 attempts     INTEGER DEFAULT 0,
-                ocr_failures INTEGER DEFAULT 0
+                ocr_failures INTEGER DEFAULT 0,
+                skipped_elements INTEGER DEFAULT 0,
+                skipped_reasons TEXT
             )
             """
         )
@@ -153,6 +157,8 @@ class JobStore:
             ("claimed_at", "REAL"),
             ("attempts", "INTEGER"),
             ("ocr_failures", "INTEGER"),
+            ("skipped_elements", "INTEGER"),
+            ("skipped_reasons", "TEXT"),
         ):
             if column not in existing:
                 self._conn.execute(f"ALTER TABLE jobs ADD COLUMN {column} {decl}")
@@ -364,6 +370,12 @@ class JobStore:
             "ocr_failures": (
                 row["ocr_failures"] if "ocr_failures" in row.keys() else 0
             ) or 0,
+            "skipped_elements": (
+                row["skipped_elements"] if "skipped_elements" in row.keys() else 0
+            ) or 0,
+            "skipped_reasons": (
+                row["skipped_reasons"] if "skipped_reasons" in row.keys() else None
+            ),
         }
 
     def close(self) -> None:

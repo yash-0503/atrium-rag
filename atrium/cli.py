@@ -1104,7 +1104,7 @@ def ingest(
 ) -> None:
     """Parse, chunk, embed and store documents in the vector store."""
     _brand("ingest")
-    from atrium.pipeline import ingest_document
+    from atrium.pipeline import describe_skipped, format_skipped, ingest_document
 
     _quiet_logs(verbose)
 
@@ -1153,22 +1153,40 @@ def ingest(
                     chunking_mode=chunking_mode,
                     chunking_config=overrides,
                 )
-                results.append((path.name, result.elements_parsed, result.chunks_written))
+                results.append((
+                    path.name,
+                    result.elements_parsed,
+                    result.chunks_written,
+                    result.skipped_elements,
+                    result.skipped_reasons,
+                ))
             except Exception as exc:
-                failures.append((path.name, f"{type(exc).__name__}: {exc}"))
+                from atrium.errors import NoReadableContentError
+
+                if isinstance(exc, NoReadableContentError):
+                    failures.append((path.name, str(exc)))
+                else:
+                    failures.append((path.name, f"{type(exc).__name__}: {exc}"))
 
     elapsed = time.monotonic() - started
     table = Table(title="Ingested", header_style="bold cyan")
     table.add_column("file")
     table.add_column("elements", justify="right")
     table.add_column("chunks", justify="right")
-    for name, elements, chunks in results:
-        table.add_row(name, str(elements), str(chunks))
+    table.add_column("skipped", justify="right")
+    for name, elements, chunks, skipped, _ in results:
+        table.add_row(name, str(elements), str(chunks), str(skipped) if skipped else "")
     console.print(table)
     console.print(
         f"[ok]{len(results)} file(s)[/] in {elapsed:.1f}s"
         + (f"  [bad]{len(failures)} failed[/]" if failures else ""),
     )
+    for name, _, _, skipped, reasons in results:
+        if skipped:
+            console.print(
+                f"  [warn]-[/] {name}: {describe_skipped(reasons)} "
+                f"({format_skipped(reasons)}) — not indexed",
+            )
     for name, err in failures:
         _err_console().print(f"  [bad]-[/] {name}: {err}")
     if failures and not results:
@@ -1373,6 +1391,13 @@ def demo(
         f"[ok]Ingested[/] {filename}: {result.elements_parsed} elements → "
         f"{result.chunks_written} chunks",
     )
+    if result.skipped_elements:
+        from atrium.pipeline import describe_skipped, format_skipped
+
+        console.print(
+            f"  [warn]-[/] {describe_skipped(result.skipped_reasons)} "
+            f"({format_skipped(result.skipped_reasons)}) — not indexed",
+        )
 
     from atrium.retrieval import retrieve_and_rerank
 
