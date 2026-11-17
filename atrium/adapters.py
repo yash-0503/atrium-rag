@@ -301,8 +301,8 @@ class OpenAICompatibleEmbedder:
 
         if not vectors:
             return
-        actual = len(vectors[0])
         expected = self._dim if self._dim > 0 else int(DEFAULTS.get("EMBED_DIM", "1024"))
+        actual = next((len(vector) for vector in vectors if len(vector) != expected), expected)
         if actual != expected:
             declared = (
                 f"EMBED_DIM says {expected}"
