@@ -429,6 +429,17 @@ skip rather than pass quietly.
 
 ---
 
+## Security
+
+Report a vulnerability through
+[GitHub's private vulnerability reporting](https://github.com/yash-0503/atrium-rag/security/advisories/new),
+or by email to `security@atrium-rag.space`. Please do not open a
+public issue for one.
+
+`SECURITY.md` has the detail.
+
+---
+
 ## License
 
 MIT. See `LICENSE`.
