@@ -354,7 +354,7 @@ def estimate_tokens(text: str) -> int:
 def _content_hash(text: str, source: SourceMetadata) -> str:
     payload = "|".join([
         text, source.file_name, str(source.page_number), str(source.page_numbers),
-        str(source.bbox), ">".join(source.section_path),
+        str(tuple(round(c, 2) for c in source.bbox)) if source.bbox else "None", ">".join(source.section_path),
     ])
     return hashlib.sha256(payload.encode("utf-8")).hexdigest()
 
@@ -443,9 +443,25 @@ def _pack_sentences(sentences: list[str], spans: list[tuple[int, int]],
         sent, span = sentences[i], spans[i]
 
         if len(sent) > target_chars and not current:
-            for j in range(0, len(sent), target_chars):
-                piece = sent[j:j + target_chars]
-                groups.append((piece, span[0] + j, span[0] + j + len(piece)))
+            pos = 0
+            while pos < len(sent):
+                end = min(pos + target_chars, len(sent))
+
+                if end < len(sent):
+                    cut = sent.rfind(" ", pos + target_chars // 2, end)
+                    if cut != -1:
+                        end = cut
+
+                piece = sent[pos:end].strip()
+
+                if piece:
+                    groups.append((piece, span[0] + pos, span[0] + end))
+
+                pos = end
+
+                while pos < len(sent) and sent[pos] == " ":
+                    pos += 1
+
             i += 1
             continue
 

@@ -20,7 +20,7 @@ from atrium.config import data_path, env_bool, env_float, env_int, env_str
 from atrium.embedder_config import build_embedder, default_base_url
 from atrium.errors import AtriumSetupError
 from atrium.job_store import JobStore
-from atrium.pipeline import run_ingestion
+from atrium.pipeline import format_skipped, run_ingestion
 from atrium.security import (
     check_content_length,
     check_mime,
@@ -702,6 +702,17 @@ async def _run_one_ingestion(
             if record.get("ocr_failures")
             else {}
         ),
+        # Elements the parser dropped instead of indexing them — pages
+        # of a scan that nothing could read, images that turned out to
+        # be decoration. Same rule: present only when there were some.
+        **(
+            {
+                "skipped_elements": record["skipped_elements"],
+                "skipped_reasons": record["skipped_reasons"],
+            }
+            if record.get("skipped_elements")
+            else {}
+        ),
     }
 
 
@@ -929,7 +940,14 @@ def get_job(job_id: str):
     record = job_store.get(job_id)
     if record is None: raise HTTPException(404)
     # Preserve the original wire shape (status, chunks_written, error) for SDK compat.
-    return {k: record[k] for k in ("status", "chunks_written", "error") if record[k] is not None}
+    out = {k: record[k] for k in ("status", "chunks_written", "error") if record[k] is not None}
+    # Elements the parser dropped instead of indexing them. Present
+    # only when there were some, so the shape is unchanged for the
+    # callers that do not care.
+    if record.get("skipped_elements"):
+        out["skipped_elements"] = record["skipped_elements"]
+        out["skipped_reasons"] = record.get("skipped_reasons")
+    return out
 
 
 @app.post("/preview")
@@ -956,6 +974,10 @@ async def preview_chunks(
 
         # 1. Parse using the new universal parser
         raw_elements = parser.parse(file_bytes, upload_name, mime)
+        # What the parser could not read. A preview of a scanned
+        # document comes back with no chunks; without this, "no chunks"
+        # and "nothing to read" look the same.
+        skipped = dict(getattr(parser, "last_parse_skipped", {}) or {})
 
         # 2. Smart Chunk — 2026-10-17: was `chunk_elements` (legacy direct
         # call). Now routes through the dispatcher so /preview matches
@@ -1001,7 +1023,17 @@ async def preview_chunks(
             "truncated": truncated,
             "chunking_mode": mode,
             "chunking_strategy": strategy,
-            "chunks": formatted_chunks
+            "chunks": formatted_chunks,
+            # Present only when there were some, so the response shape
+            # is unchanged for the documents that parsed cleanly.
+            **(
+                {
+                    "skipped_elements": sum(skipped.values()),
+                    "skipped_reasons": format_skipped(skipped),
+                }
+                if skipped
+                else {}
+            ),
         }
     except HTTPException:
         # A rejected request (size, MIME, chunking override) keeps its

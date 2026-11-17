@@ -1,10 +1,11 @@
 import logging
 import threading
 import uuid
-from dataclasses import dataclass
-from typing import List, Optional
+from dataclasses import dataclass, field
+from typing import Dict, List, Optional
 
 from atrium.adapters import EmbeddingAdapter, VectorDBAdapter
+from atrium.errors import NoReadableContentError
 from atrium.models import ChunkRecord, SourceMetadata
 
 log = logging.getLogger("ingest.pipeline")
@@ -14,7 +15,7 @@ log = logging.getLogger("ingest.pipeline")
 # the consumer-facing /ingest + /retrieval_lab endpoints use, and so
 # future preset/strategy changes propagate without a pipeline edit.
 from atrium.smart_chunker import chunk_with_mode
-from atrium.universal_parser import UniversalParser
+from atrium.universal_parser import PAGE_LEVEL_SKIP_REASONS, UniversalParser
 
 # ---------------------------------------------------------------------------
 # Per-document locking
@@ -141,6 +142,60 @@ class IngestResult:
     #: scanned document that OCRed to nothing still looks like a
     #: successful ingest otherwise.
     ocr_failures: int = 0
+    #: Elements the parser dropped instead of emitting them: pages of a
+    #: scan that nothing could read, images that turned out to be
+    #: decoration, vision calls that failed. They are not indexed, so
+    #: they cannot crowd out the text that was — but the count is
+    #: reported, because a document that quietly lost half its pages
+    #: is a document the operator needs to know about.
+    skipped_elements: int = 0
+    #: Why they were skipped, and how many of each reason.
+    skipped_reasons: Dict[str, int] = field(default_factory=dict)
+
+
+def format_skipped(reasons: Optional[Dict[str, int]]) -> str:
+    """The skip reasons as one compact, comparable string.
+
+    "no_vision_or_ocr_adapter=12,image_blank=3". The same string is
+    used on the job row, in the failure message, and in the CLI, so
+    the three never disagree about why a document lost content.
+
+    The order is by count and then by reason, so two documents that
+    lost the same things produce the same string and a job table can
+    be compared across rows.
+    """
+    if not reasons:
+        return ""
+    ordered = sorted(reasons.items(), key=lambda pair: (-pair[1], pair[0]))
+    return ",".join(f"{reason}={count}" for reason, count in ordered)
+
+
+def describe_skipped(reasons: Optional[Dict[str, int]]) -> str:
+    """The skip reasons as a sentence, for a person to read.
+
+    "12 page(s) unreadable, 3 image(s) skipped". A page skip and an
+    element skip are different problems — one document is short of
+    content, the other has a few pictures missing — so they are
+    counted apart.
+
+    Every element-level reason today is an image: a picture that was
+    decoration, a vision call that failed, a vision budget that ran
+    out. So the count is reported as images, which is what the
+    operator will recognise.
+    """
+    if not reasons:
+        return ""
+    pages = sum(
+        count for reason, count in reasons.items()
+        if reason in PAGE_LEVEL_SKIP_REASONS
+    )
+    elements = sum(reasons.values()) - pages
+    parts = []
+    if pages:
+        parts.append(f"{pages} page(s) unreadable")
+    if elements:
+        parts.append(f"{elements} image(s) skipped")
+    return ", ".join(parts)
 
 
 def ingest_document(
@@ -168,7 +223,27 @@ def ingest_document(
 
     # 1. Parse using the ML-free universal parser.
     raw_elements = parser.parse(file_bytes, filename, mime_type)
+    # The skips are read here, immediately after the parse, and kept in
+    # a local: the parser is shared between documents and its state
+    # belongs to whichever parse ran last, so reading it later — after
+    # the chunking, or after a failure — can report another document's
+    # numbers.
+    skipped = dict(getattr(parser, "last_parse_skipped", {}) or {})
+    skipped_total = sum(skipped.values())
     if not raw_elements:
+        # Nothing readable at all. The ingest fails rather than
+        # reporting a clean success with nothing in it: a document
+        # that produced zero chunks must not look like an ingested
+        # document. A document that lost *some* content is not a
+        # failure — it completes, and the skips are reported.
+        if skipped:
+            raise NoReadableContentError(
+                f"No readable content: {describe_skipped(skipped)} "
+                f"({format_skipped(skipped)}). "
+                "Enable OCR_ENABLED=1 or VISION_ENABLED=1 to read scanned pages.",
+                skipped_elements=skipped_total,
+                skipped_reasons=skipped,
+            )
         raise ValueError("No content parsed.")
 
     # 2. Smart Chunking (handles overlap, table splitting, and content hashing).
@@ -223,6 +298,8 @@ def ingest_document(
         elements_parsed=len(raw_elements),
         chunking_mode=chunking_mode,
         ocr_failures=int(getattr(parser, "last_parse_ocr_failures", 0) or 0),
+        skipped_elements=skipped_total,
+        skipped_reasons=skipped,
     )
 
 
@@ -249,6 +326,8 @@ def run_ingestion(job_id: str, doc_id: str, file_bytes: bytes, filename: str, mi
             status="complete",
             chunks_written=result.chunks_written,
             ocr_failures=result.ocr_failures,
+            skipped_elements=result.skipped_elements,
+            skipped_reasons=format_skipped(result.skipped_reasons),
         )
         if result.ocr_failures:
             # The document is in the corpus, but some of its pages were
@@ -258,6 +337,31 @@ def run_ingestion(job_id: str, doc_id: str, file_bytes: bytes, filename: str, mi
                 "job %s: %d page(s) could not be read by OCR",
                 job_id, result.ocr_failures,
             )
+        if result.skipped_elements:
+            # The document is in the corpus, but some of it was
+            # dropped rather than indexed — pages of a scan that
+            # nothing could read, images that turned out to be
+            # decoration. The count is on the job row so it can be
+            # asked about later; the log says it now.
+            log.warning(
+                "job %s: %s (%s)",
+                job_id,
+                describe_skipped(result.skipped_reasons),
+                format_skipped(result.skipped_reasons),
+            )
+    except NoReadableContentError as e:
+        # The document had nothing readable in it. The counts travel on
+        # the exception, so the row records why without reading the
+        # parser's state again — the parser is shared, and its state
+        # belongs to whichever parse ran last.
+        job_store.update(
+            job_id,
+            status="failed",
+            error=str(e),
+            skipped_elements=e.skipped_elements,
+            skipped_reasons=format_skipped(e.skipped_reasons),
+        )
+        raise
     except Exception as e:
         job_store.update(job_id, status="failed", error=str(e))
         # The failure is recorded on the job row *and* raised. Swallowing

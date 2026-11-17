@@ -10,9 +10,9 @@ obvious, the error says it.
 """
 from __future__ import annotations
 
-from typing import Iterable
+from typing import Dict, Iterable
 
-__all__ = ["AtriumSetupError"]
+__all__ = ["AtriumSetupError", "NoReadableContentError"]
 
 
 class AtriumSetupError(Exception):
@@ -37,3 +37,36 @@ class AtriumSetupError(Exception):
         lines = [self.message, ""]
         lines.extend(f"  {hint}" for hint in self.hints)
         return "\n".join(lines)
+
+
+class NoReadableContentError(ValueError):
+    """The document parsed, and none of it was readable.
+
+    A scanned PDF with no OCR and no vision configured is the usual
+    cause: every page is a picture, nothing can read it, and the
+    document has no text at all. The ingest fails rather than
+    reporting a clean success with nothing in it — a document that
+    produced zero chunks must not look like an ingested document.
+
+    It is a `ValueError` because that is what the API maps to 422,
+    "the document could not be parsed". It is *not* an
+    `AtriumSetupError`, which maps to 503: the service is fine, the
+    document is an unreadable scan, and telling the client to retry
+    would be advice that never helps.
+
+    The counts travel on the exception so the job row can record why
+    the document was empty without reading the parser's state again
+    — the parser is shared, and its state belongs to whichever parse
+    ran last.
+    """
+
+    def __init__(
+        self,
+        message: str,
+        skipped_elements: int = 0,
+        skipped_reasons: Dict[str, int] | None = None,
+    ) -> None:
+        super().__init__(message)
+        self.message = message
+        self.skipped_elements = int(skipped_elements)
+        self.skipped_reasons: Dict[str, int] = dict(skipped_reasons or {})

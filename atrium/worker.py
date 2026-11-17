@@ -23,6 +23,7 @@ import uuid
 from atrium.adapters import build_store
 from atrium.config import data_path, env_bool, env_float, env_int, env_str
 from atrium.embedder_config import build_embedder, default_base_url
+from atrium.errors import NoReadableContentError
 from atrium.job_store import JobStore
 from atrium.pipeline import run_ingestion
 from atrium.universal_parser import UniversalParser
@@ -245,6 +246,11 @@ def _process_one(job: dict, parser, vision, ocr_adapter, embedder, db, job_store
             "job %s: timed out after %ss; the document is not being ingested",
             job_id, JOB_TIMEOUT_SECONDS,
         )
+    except NoReadableContentError as exc:
+        # The document had nothing readable in it. That is a fact about
+        # the document, not a fault in the worker, so it is a line of
+        # log rather than a traceback.
+        log.error("job %s: %s", job_id, exc)
     except Exception as exc:
         # run_ingestion already updates status to failed; we wrap here
         # so ops gets the traceback.

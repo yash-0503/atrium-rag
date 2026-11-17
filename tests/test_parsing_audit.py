@@ -291,8 +291,12 @@ def _load_fixture(sub: str):
     if not meta_path.exists() or not src_files:
         return None
     meta = _json.loads(meta_path.read_text())
-    if meta.get("_source") in (None, "", "null") or meta.get("min_chunks", 0) == 0:
-        # DEFERRED fixture (e.g. RTF — see docs/audits/PARSING_AUDIT.md §5.2)
+    if meta.get("_source") in (None, "", "null") or meta.get("_deferred"):
+        # DEFERRED fixture (e.g. RTF — see docs/audits/PARSING_AUDIT.md §5.2).
+        # "min_chunks == 0" is NOT a deferral signal: a real fixture can
+        # legitimately parse to zero elements — 25_raw_image does, with
+        # no vision or OCR adapter — and treating that as DEFERRED
+        # would silently drop the coverage instead of asserting it.
         return meta
     src = src_files[0]
     raw = src.read_bytes()
@@ -414,10 +418,14 @@ def test_txt_frankenstein_parses():
     )
 
 
-def test_raw_image_cat_jpeg_emits_placeholder():
+def test_raw_image_cat_jpeg_emits_nothing_without_vision():
     """Real Wikimedia Commons JPEG. raw_image path must:
-    - Emit exactly 1 element (the image_caption placeholder)
-    - With type=image_caption
+    - Emit no elements, because there is no text to emit and a
+      placeholder is not content: it used to be embedded and stored
+      like real text, so it came back in the top-k of every unrelated
+      search
+    - Record why it emitted nothing, so the ingest can say "0 pages
+      readable" instead of reporting a clean success
     - Not crash on parse even without a vision or OCR adapter that
       returns content
     """
@@ -425,13 +433,29 @@ def test_raw_image_cat_jpeg_emits_placeholder():
     if loaded is None or not isinstance(loaded, tuple):
         pytest.skip("raw image fixture not present")
     raw, name, mime, meta = loaded
+    # The fixture metadata states the same contract the parser has to
+    # honour, so the two cannot drift apart silently.
+    assert meta["expected_element_types"] == [], (
+        f"{name}: expected_element_types should be empty now that the "
+        f"placeholder is dropped, got {meta['expected_element_types']}"
+    )
+    assert meta["min_chunks"] == 0, (
+        f"{name}: min_chunks should be 0 — the fixture yields no "
+        f"elements, got {meta['min_chunks']}"
+    )
     parser = _ParserForFixtures()
     elements = parser.parse(raw, name, mime)
-    assert len(elements) == 1, (
-        f"{name}: expected exactly 1 image_caption element, got {len(elements)}"
+    assert elements == [], (
+        f"{name}: expected no elements without vision or OCR, "
+        f"got {len(elements)}"
     )
-    assert elements[0].type == "image_caption", (
-        f"{name}: expected type=image_caption, got {elements[0].type}"
+    assert parser.last_parse_skipped == {"no_vision_or_ocr_adapter": 1}, (
+        f"{name}: expected the skip to be counted, "
+        f"got {parser.last_parse_skipped}"
+    )
+    assert parser.last_parse_skipped == meta["expect_skipped_reasons"], (
+        f"{name}: fixture metadata expects "
+        f"{meta['expect_skipped_reasons']}, got {parser.last_parse_skipped}"
     )
 
 

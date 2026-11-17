@@ -128,6 +128,7 @@ class ParsedElement:
     bbox: Optional[tuple] = None
     heading_level: Optional[int] = None                      # only set for type == "heading"
     section_path: list[str] = field(default_factory=list)    # ancestor headings at emission time
+    skipped_reason: Optional[str] = None
 
 
 class VisionCaptionAdapter(Protocol):
@@ -197,6 +198,12 @@ CAPTION_PROMPT = ("Describe this image in 2 short sentences only, no more. "
 # Only raster formats a vision model can actually decode (skips EMF/WMF/SVG).
 CAPTIONABLE_IMAGE_MIMES = {"image/png", "image/jpeg", "image/jpg", "image/gif", "image/bmp",
                            "image/tiff", "image/webp"}
+
+
+PAGE_LEVEL_SKIP_REASONS = frozenset({
+    "no_vision_or_ocr_adapter",
+    "ocr_returned_no_text",
+})
 
 # Spreadsheet-style tables (XLSX, XLS, CSV, ODS) with more than this many
 # data rows get chunked at this boundary with the header row repeated per
@@ -282,6 +289,7 @@ class UniversalParser:
         state = self._parse_state()
         state["calls"] = 0
         state["pending"] = []
+        state["skipped"] = {}
         # The OCR adapter counts the pages it could not read; the count
         # is read by the ingest so a document with unreadable pages is
         # not reported as a clean success.
@@ -346,7 +354,7 @@ class UniversalParser:
             raise ValueError(f"Unsupported mime_type: {mime_type}")
 
         self._resolve_pending_vision()
-        return elements
+        return self._drop_skipped(elements)
 
     def _check_archive_expansion(self, file_bytes: bytes, mime_type: str) -> None:
         """Reject a zip-container document that expands too far.
@@ -401,9 +409,37 @@ class UniversalParser:
         """
         state = getattr(self._local, "state", None)
         if state is None:
-            state = {"calls": 0, "pending": []}
+            state = {"calls": 0, "pending": [], "skipped": {}}
             self._local.state = state
         return state
+
+    def _drop_skipped(self, elements):
+        """The elements worth keeping, and a count of why the rest were not.
+
+        An element is dropped when the parser decided it was not
+        content: a scanned page with no OCR and no vision to read it,
+        an image that turned out to be a rule or a blank, a vision call
+        that failed. Those elements used to carry a placeholder string
+        instead — "[Scanned page — no vision or OCR adapter configured]"
+        — which was then embedded and stored like real content, so it
+        came back in the top-k of every search that touched the
+        document and crowded out the text that was actually there.
+
+        An element with no text and no reason is not a skip: it was
+        never content (an empty table cell, a heading with nothing
+        under it), so it is dropped without being counted. Counting it
+        would report unreadable pages that do not exist.
+        """
+        kept, skipped = [], Counter()
+        for el in elements:
+            if el.skipped_reason:
+                skipped[el.skipped_reason] += 1
+            elif not (el.text or "").strip():
+                continue
+            else:
+                kept.append(el)
+        self._parse_state()["skipped"] = dict(skipped)
+        return kept
 
     @property
     def last_parse_ocr_failures(self) -> int:
@@ -412,6 +448,24 @@ class UniversalParser:
         if ocr is None:
             return 0
         return int(getattr(ocr, "failures", 0) or 0)
+
+    @property
+    def last_parse_skipped(self) -> dict:
+        """Why elements were dropped in the last parse, and how many of each.
+
+        The counterpart to :attr:`last_parse_ocr_failures`. That one
+        counts the pages OCR could not read; this one counts the
+        elements the parser chose not to emit at all. The reasons are
+        the keys, so the caller can say *which* — "12 pages had no OCR
+        and no vision" is a different problem from "3 images were
+        blank", and they need different fixes.
+
+        :data:`PAGE_LEVEL_SKIP_REASONS` says which reasons mean a
+        page was unreadable rather than an image dropped;
+        ``atrium.pipeline.describe_skipped`` turns the breakdown into
+        the sentence a person reads.
+        """
+        return dict(self._parse_state().get("skipped", {}))
 
 
     def _safe_parse(self, label: str, fn, *args) -> list[ParsedElement]:
@@ -549,6 +603,34 @@ class UniversalParser:
 
         return self._attach_section_paths(raw_elements)
 
+    def _image_junk_reason(self, image_bytes, w_pt, h_pt, page_rect, page_has_text):
+        """Why this image is not worth captioning, or None if it is.
+
+        The import is outside the try on purpose. Inside it, a missing
+        Pillow would land in the same except as a corrupt image and
+        return "undecodable" — which drops the image. Every image in
+        every PDF would disappear, silently, and the document would
+        look like it had no pictures in it at all.
+        """
+        from PIL import Image, ImageStat
+
+        try:
+            img = Image.open(io.BytesIO(image_bytes)).convert("L").resize((64, 64))
+        except Exception:
+            return "undecodable"
+        if ImageStat.Stat(img).stddev[0] < 4:
+            return "blank"
+        if max(w_pt, h_pt) / max(1.0, min(w_pt, h_pt)) > 15:
+            return "line"
+        if page_has_text and (w_pt * h_pt) / (page_rect.width * page_rect.height) > 0.9:
+            return "background"
+        return None
+
+    @staticmethod
+    def _ocr_text_is_usable(text: str) -> bool:
+        t = "".join((text or "").split())
+        return len(t) >= 30 and sum(c.isalnum() for c in t) / len(t) >= 0.6
+
     def _parse_pdf_page(self, page, page_num: int, heading_levels: dict,
                          body_font_size: float, page_texts_by_band: dict,
                          raw_elements: list[ParsedElement],
@@ -626,9 +708,11 @@ class UniversalParser:
                     element.type = "paragraph"
                     element.text = text
                 else:
-                    element.text = "[Scanned page \u2014 OCR returned no text]"
+                    element.text = ""
+                    element.skipped_reason = "ocr_returned_no_text"
             else:
-                element.text = "[Scanned page \u2014 no vision or OCR adapter configured]"
+                element.text = ""
+                element.skipped_reason = "no_vision_or_ocr_adapter"
             return carry_paragraph
 
         ordered_items = self._order_items_reading_order(candidate_items + table_items, page_rect.width)
@@ -647,7 +731,11 @@ class UniversalParser:
                 clean_line = _clean_glyph_noise(line_str)
                 if not clean_line:
                     continue
-                max_font_size = max((s.size for s in line_spans), default=10.0)
+                sizes = Counter()
+                for s in line_spans:
+                    sizes[round(s.size, 1)] += len(s.text.strip())
+
+                dominant = sizes.most_common(1)[0][0] if sizes else 10.0
                 is_mono = any(_is_monospace(s.font) for s in line_spans)
                 # PyMuPDF's flag bits: 16 is bold, 2 is *italic*. The
                 # old check tested bit 2, so italic body text counted
@@ -656,7 +744,7 @@ class UniversalParser:
                               for s in line_spans)
                 block_lines_data.append({
                     "text": line_str.rstrip("\n"), "clean_text": clean_line,
-                    "font_size": round(max_font_size, 1), "is_mono": is_mono, "is_bold": is_bold,
+                    "font_size": dominant, "is_mono": is_mono, "is_bold": is_bold,
                 })
             if not block_lines_data:
                 continue
@@ -779,19 +867,63 @@ class UniversalParser:
             image_bytes = image.data
             if not image_bytes:
                 continue
+
             displayed_w = image.bbox[2] - image.bbox[0]
             displayed_h = image.bbox[3] - image.bbox[1]
+
             if displayed_w < MIN_IMAGE_DISPLAY_PT or displayed_h < MIN_IMAGE_DISPLAY_PT:
                 continue
-            element = ParsedElement(type="image_caption", text="[Diagram/figure \u2014 pending vision]",
-                                     page=page_num)
+
+            # Filter decorative or irrelevant images.
+            reason = self._image_junk_reason(
+                image_bytes,
+                displayed_w,
+                displayed_h,
+                page_rect,
+                total_page_text_chars >= SCANNED_PAGE_ABS_TEXT_CHARS,
+            )
+            if reason:
+                raw_elements.append(
+                    ParsedElement(
+                        type="image_caption",
+                        text="",
+                        page=page_num,
+                        skipped_reason=f"image_{reason}",
+                    )
+                )
+                continue
+
+            # Try OCR before sending the image to vision.
+            if self.ocr:
+                ocr_text = self.ocr.transcribe(image_bytes)
+                if self._ocr_text_is_usable(ocr_text):
+                    raw_elements.append(
+                        ParsedElement(
+                            type="paragraph",
+                            text=ocr_text,
+                            page=page_num,
+                        )
+                    )
+                    continue
+
+            # Fall through to the existing vision queue.
+            element = ParsedElement(
+                type="image_caption",
+                text="[Diagram/figure — pending vision]",
+                page=page_num,
+            )
             raw_elements.append(element)
-            self._queue_vision_caption(element, image_bytes, image.mime,
-                                        context=CAPTION_PROMPT, truncate_summary=True,
-                                        max_tokens=DIAGRAM_CAPTION_MAX_TOKENS)
+
+            self._queue_vision_caption(
+                element,
+                image_bytes,
+                image.mime,
+                context=CAPTION_PROMPT,
+                truncate_summary=True,
+                max_tokens=DIAGRAM_CAPTION_MAX_TOKENS,
+            )
 
         return carry_paragraph
-
     @staticmethod
     def _flush_carry(raw_elements: list[ParsedElement],
                       carry_paragraph: Optional[ParsedElement]) -> Optional[ParsedElement]:
@@ -1157,7 +1289,8 @@ class UniversalParser:
                               context: Optional[str] = None, truncate_summary: bool = True,
                               max_tokens: Optional[int] = None) -> None:
         if not self.vision:
-            element.text = "[Image \u2014 no vision adapter configured]"
+            element.text = ""
+            element.skipped_reason = "no_vision_adapter"
             return
 
         downscaled_bytes, downscaled_mime = self._downscale_for_vision(image_bytes)
@@ -1170,7 +1303,8 @@ class UniversalParser:
         state = self._parse_state()
         if (self.max_vision_calls_per_doc is not None
                 and state["calls"] >= self.max_vision_calls_per_doc):
-            element.text = "[Image \u2014 vision call budget exhausted for this document]"
+            element.text = ""
+            element.skipped_reason = "vision_budget_exhausted"
             return
 
         state["calls"] += 1
@@ -1193,7 +1327,8 @@ class UniversalParser:
             except Exception as e:
                 # Was silently swallowed before, which made caption problems undiagnosable.
                 log.warning("Vision caption failed (%s: %s)", type(e).__name__, e)
-                caption = "[Image \u2014 vision call failed]"
+                element.skipped_reason = "vision_call_failed"
+                caption = ""
             if truncate_summary:
                 # Defense in depth: the prompt already asks for brevity and
                 # the adapter caps generation length, but not every model
@@ -1209,7 +1344,8 @@ class UniversalParser:
         with concurrent.futures.ThreadPoolExecutor(max_workers=self.vision_concurrency) as pool:
             for element, digest, caption in pool.map(_call, pending):
                 element.text = caption
-                self._vision_cache[digest] = caption
+                if caption:
+                    self._vision_cache[digest] = caption
 
         self._parse_state()["pending"] = []
 
@@ -1708,9 +1844,11 @@ class UniversalParser:
                 element.type = "paragraph"
                 element.text = text
             else:
-                element.text = "[Image \u2014 OCR returned no text]"
+                element.text = ""
+                element.skipped_reason = "ocr_returned_no_text"
         else:
-            element.text = "[Image \u2014 no vision or OCR adapter configured]"
+            element.text = ""
+            element.skipped_reason = "no_vision_or_ocr_adapter"
         return [element]
 
     # -- Plain text (Tier 1.1) ---------------------------------------------
