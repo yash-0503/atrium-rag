@@ -390,7 +390,7 @@ def verify(values: Dict[str, str]) -> List[Check]:
             except Exception as exc:
                 actual = getattr(exc, "actual_dim", None)
                 expected = getattr(exc, "expected_dim", None)
-                if actual and expected:
+                if actual is not None and expected is not None:
                     checks.append(
                         Check(
                             "embedding dimension",
