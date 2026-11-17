@@ -14,7 +14,7 @@ from typing import Any, Dict, List, Optional, Protocol
 
 from tenacity import retry, stop_after_attempt, wait_exponential
 
-from atrium.config import data_path
+from atrium.config import DEFAULTS, data_path
 from atrium.models import ChunkRecord, source_fields
 
 # The vector-store client libraries are imported *inside* the adapter
@@ -212,7 +212,11 @@ class OpenAICompatibleEmbedder:
     ):
         self.base_url = base_url.rstrip("/")
         self.model = model
-        self._dim = dim
+        # The *declared* dimension: what the configuration says the
+        # endpoint returns. It is not a measurement — only the endpoint
+        # knows that — so it is checked against what actually comes
+        # back, in `embed()`.
+        self._dim = int(dim or 0)
         self.api_key = api_key or ""
 
     def _headers(self) -> Dict[str, str]:
@@ -234,7 +238,7 @@ class OpenAICompatibleEmbedder:
                     json={"input": texts, "model": self.model},
                 )
                 resp.raise_for_status()
-                return [item["embedding"] for item in resp.json()["data"]]
+                data = resp.json()["data"]
         except httpx.ConnectError as exc:
             raise AtriumSetupError(
                 f"The embedding endpoint at {self.base_url} is not answering.",
@@ -273,8 +277,57 @@ class OpenAICompatibleEmbedder:
                 ),
             ) from exc
 
+        return self._vectors_from(data, texts)
+
+    def _vectors_from(self, data: List[Any], texts: List[str]) -> List[List[float]]:
+        from atrium.errors import AtriumSetupError
+
+        if len(data) != len(texts):
+            raise AtriumSetupError(
+                f"The embedding endpoint at {self.base_url} returned "
+                f"{len(data)} vectors for {len(texts)} texts.",
+                hints=(
+                    "The endpoint is dropping results — check its logs "
+                    "and its batch size limit",
+                ),
+            )
+
+        vectors = [item["embedding"] for item in data]
+        self._check_dimension(vectors)
+        return vectors
+
+    def _check_dimension(self, vectors: List[List[float]]) -> None:
+        from atrium.errors import AtriumSetupError
+
+        if not vectors:
+            return
+        actual = len(vectors[0])
+        expected = self._dim if self._dim > 0 else int(DEFAULTS.get("EMBED_DIM", "1024"))
+        if actual != expected:
+            declared = (
+                f"EMBED_DIM says {expected}"
+                if self._dim > 0
+                else f"EMBED_DIM is not set (the default is {expected})"
+            )
+            error = AtriumSetupError(
+                f'The model "{self.model}" at {self.base_url} returned '
+                f"{actual}-dimension vectors, but {declared}.",
+                hints=(
+                    f"Set EMBED_DIM={actual} in .env, or change EMBED_MODEL "
+                    f"to one that returns {expected} dimensions",
+                    "The vector store's collection may have to be re-created "
+                    "at the new dimension",
+                ),
+            )
+            error.actual_dim = actual
+            error.expected_dim = expected
+            raise error
+
     @property
-    def dimension(self) -> int: return self._dim
+    def dimension(self) -> int:
+        if self._dim > 0:
+            return self._dim
+        return int(DEFAULTS.get("EMBED_DIM", "1024"))
 
     def health(self) -> bool:
         return self.probe()[0]

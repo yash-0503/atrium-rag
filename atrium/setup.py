@@ -388,14 +388,26 @@ def verify(values: Dict[str, str]) -> List[Check]:
                 else:
                     checks.append(Check("embedding dimension", True, f"{actual} dimensions"))
             except Exception as exc:
-                checks.append(
-                    Check(
-                        "embedding call",
-                        False,
-                        f"{type(exc).__name__}: {exc}",
-                        "Check the model name and the API key",
+                actual = getattr(exc, "actual_dim", None)
+                expected = getattr(exc, "expected_dim", None)
+                if actual and expected:
+                    checks.append(
+                        Check(
+                            "embedding dimension",
+                            False,
+                            f"the model returns {actual} dimensions, EMBED_DIM says {expected}",
+                            f"Set EMBED_DIM={actual} in .env",
+                        )
                     )
-                )
+                else:
+                    checks.append(
+                        Check(
+                            "embedding call",
+                            False,
+                            f"{type(exc).__name__}: {exc}",
+                            "Check the model name and the API key",
+                        )
+                    )
 
     store_kind = (values.get("VECTOR_DB") or "sqlite").lower()
     store_fix = "Start it, or set VECTOR_DB=sqlite for the local store"
