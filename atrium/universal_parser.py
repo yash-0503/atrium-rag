@@ -1399,11 +1399,6 @@ class UniversalParser:
             except Exception as exc:
                 last_exc = exc
                 if attempt >= attempts or not _is_transient_vision_error(exc):
-                    if attempt > 1:
-                        log.warning(
-                            "Vision caption failed after %d attempt(s) (%s: %s)",
-                            attempt, type(exc).__name__, exc,
-                        )
                     raise
                 delay = min(base_delay * (2 ** (attempt - 1)), VISION_RETRY_MAX_DELAY)
                 # Jitter, so that a document with many images does not
