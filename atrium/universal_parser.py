@@ -1359,7 +1359,7 @@ class UniversalParser:
                 )
             except Exception as e:
                 log.warning("Vision caption failed (%s: %s)", type(e).__name__, e)
-                return element, digest, None
+                element.skipped_reason = "vision_call_failed"
             if truncate_summary:
                 caption = self._truncate_caption(caption)
             return element, digest, caption
