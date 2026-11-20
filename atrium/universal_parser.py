@@ -1358,27 +1358,19 @@ class UniversalParser:
                     img_bytes, mime, context, max_tokens,
                 )
             except Exception as e:
-                # Was silently swallowed before, which made caption problems undiagnosable.
                 log.warning("Vision caption failed (%s: %s)", type(e).__name__, e)
                 element.skipped_reason = "vision_call_failed"
-                caption = ""
             if truncate_summary:
-                # Defense in depth: the prompt already asks for brevity and
-                # the adapter caps generation length, but not every model
-                # (especially small local ones) reliably obeys either — so
-                # a diagram/photo caption is hard-capped here regardless of
-                # what the model actually returned. Full-page scan
-                # transcriptions skip this: there, the "caption" IS the
-                # page's entire content, and truncating it would discard
-                # real text, not just a wordy description.
                 caption = self._truncate_caption(caption)
             return element, digest, caption
 
         with concurrent.futures.ThreadPoolExecutor(max_workers=self.vision_concurrency) as pool:
             for element, digest, caption in pool.map(_call, pending):
+                if caption is None:
+                    element.text = ""      # dropped in parse(); never cached
+                    continue
                 element.text = caption
-                if caption:
-                    self._vision_cache[digest] = caption
+                self._vision_cache[digest] = caption
 
         self._parse_state()["pending"] = []
 
