@@ -22,6 +22,7 @@ verification step runs against what was actually written.
 from __future__ import annotations
 
 import json
+import os
 import shutil
 import subprocess
 import sys
@@ -148,6 +149,7 @@ class Environment:
     postgres_reachable: bool = False
     tesseract_installed: bool = False
     tesseract_binding_installed: bool = False
+    tesseract_cmd: str = ""
     rapidocr_installed: bool = False
     fastembed_installed: bool = False
     endpoints: List[Endpoint] = field(default_factory=list)
@@ -163,7 +165,12 @@ class Environment:
         if chosen == "rapidocr":
             return self.rapidocr_installed
         if chosen in ("tesseract", ""):
-            return self.tesseract_installed and self.tesseract_binding_installed
+            if not self.tesseract_binding_installed:
+                return False
+            if self.tesseract_cmd:
+                # An explicit path: it has to exist and be executable.
+                return os.access(self.tesseract_cmd, os.X_OK)
+            return self.tesseract_installed
         return False
 
 
@@ -248,6 +255,12 @@ def detect_environment() -> Environment:
             env.qdrant_reachable = False
 
     env.tesseract_installed = _which("tesseract")
+    try:
+        from atrium.config import env_str
+
+        env.tesseract_cmd = (env_str("TESSERACT_CMD") or "").strip()
+    except Exception:
+        env.tesseract_cmd = ""
 
     try:
         import pytesseract  # noqa: F401
@@ -1166,17 +1179,16 @@ def _choose_non_interactive(env: Environment, existing: Dict[str, str], set_valu
         set_value("EMBED_PROVIDER", "fastembed", "detected")
         set_value("EMBED_MODEL", "BAAI/bge-small-en-v1.5", "detected")
         set_value("EMBED_DIM", "384", "detected")
-        return
-    endpoint = env.endpoints[0] if env.endpoints else None
-    set_value("EMBED_PROVIDER", "http", "detected")
-    set_value(
-        "EMBED_BASE_URL",
-        endpoint.base_url if endpoint else "http://localhost:11434/v1",
-        "detected",
-    )
-    set_value("EMBED_MODEL", existing.get("EMBED_MODEL", "bge-large"), "detected")
-    set_value("EMBED_DIM", existing.get("EMBED_DIM", "1024"), "detected")
-
+    else:
+        endpoint = env.endpoints[0] if env.endpoints else None
+        set_value("EMBED_PROVIDER", "http", "detected")
+        set_value(
+            "EMBED_BASE_URL",
+            endpoint.base_url if endpoint else "http://localhost:11434/v1",
+            "detected",
+        )
+        set_value("EMBED_MODEL", existing.get("EMBED_MODEL", "bge-large"), "detected")
+        set_value("EMBED_DIM", existing.get("EMBED_DIM", "1024"), "detected")
     for provider in ("rapidocr", "tesseract"):
         if env.ocr_available(provider):
             set_value("OCR_ENABLED", "1", "detected")
@@ -1263,14 +1275,54 @@ def _offer_actions(
                 f"[warn]OCR is enabled with {provider}, but that engine cannot be "
                 f"built on this machine — scanned pages would be skipped.[/]"
             )
-            offer(
-                'Install the OCR engine? (pip install "atrium-rag[ocr]")',
-                lambda: subprocess.run(
-                    [sys.executable, "-m", "pip", "install", "atrium-rag[ocr]"],
-                    check=True,
-                    timeout=900,
-                ),
-            )
+            if provider == "tesseract":
+                if env.rapidocr_installed:
+                    console.print(
+                        "[dim]Tesseract needs its system binary, which pip "
+                        "cannot install. rapidocr is already installed and "
+                        "needs nothing else — use it instead?[/]"
+                    )
+                    if _yes_no(
+                        console,
+                        "Use rapidocr for OCR instead?",
+                        True,
+                        "pip-only — no binary to install",
+                    ):
+                        values["OCR_PROVIDER"] = "rapidocr"
+                        console.print("[ok]Using rapidocr for OCR.[/]")
+                else:
+                    console.print(
+                        "[dim]Tesseract needs its system binary, which pip "
+                        "cannot install (brew install tesseract / apt install "
+                        "tesseract-ocr). Install rapidocr instead — pip-only, "
+                        "no binary needed?[/]"
+                    )
+                    if _yes_no(
+                        console,
+                        "Install rapidocr for OCR? (pip install \"atrium-rag[ocr]\")",
+                        True,
+                        "pip-only — no binary to install",
+                    ):
+                        try:
+                            subprocess.run(
+                                [sys.executable, "-m", "pip", "install",
+                                 "atrium-rag[ocr]"],
+                                check=True,
+                                timeout=900,
+                            )
+                            values["OCR_PROVIDER"] = "rapidocr"
+                            console.print("[ok]Using rapidocr for OCR.[/]")
+                        except Exception as exc:
+                            console.print(f"[bad]could not:[/] {exc}")
+            else:
+                offer(
+                    'Install the OCR engine? (pip install "atrium-rag[ocr]")',
+                    lambda: subprocess.run(
+                        [sys.executable, "-m", "pip", "install", "atrium-rag[ocr]"],
+                        check=True,
+                        timeout=900,
+                    ),
+                )
 
 
 # ---------------------------------------------------------------------------

@@ -482,7 +482,7 @@ def _validate(values: Dict[str, str]) -> List[str]:
 
     if (effective.get("OCR_ENABLED") or "0").strip().lower() == "1" and effective.get("OCR_PROVIDER") == "tesseract":
         try:
-            import pytesseract 
+            import pytesseract
         except ImportError:
             problems.append(
                 "OCR_PROVIDER=tesseract requires `pip install atrium-rag[ocr]` "
