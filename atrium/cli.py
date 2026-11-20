@@ -679,7 +679,7 @@ def _plain(text: str) -> str:
 
 
 def _probe_ocr(values: Dict[str, str]) -> Tuple[bool, str]:
-    enabled = (values.get("OCR_ENABLED", "0") or "0").strip()
+    enabled = (values.get("OCR_ENABLED", "0") or "0").strip().lower()
     if enabled not in ("1", "true", "yes", "on"):
         return True, "disabled"
     try:
