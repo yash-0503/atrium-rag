@@ -18,6 +18,7 @@ don't always reliably follow "be brief" instructions on their own.
 from __future__ import annotations
 
 import base64
+import re
 from typing import Optional
 
 # `httpx` is imported lazily, inside the methods that make a request.
@@ -26,6 +27,31 @@ from typing import Optional
 # vision-capable document) should not pay for it at boot.
 
 DEFAULT_MAX_TOKENS = 1000   # generous default for full transcriptions/standalone images
+
+_REASONING_PREAMBLE = re.compile(
+    r"^\s*(okay|ok|alright|hmm|well|got it|let'?s|let me|i need to|i think|"
+    r"i'?ll|we need to|we have|we must|we can|the user|the prompt)\b[^.]*\.\s*",
+    re.IGNORECASE,
+)
+
+
+def _clean_model_output(text: str) -> str:
+    text = (text or "").strip()
+    if not text:
+        return ""
+
+    # A complete reasoning block: keep what follows it.
+    if "</think>" in text:
+        text = text.split("</think>", 1)[1].strip()
+    # An unterminated one: keep nothing, because the reasoning is all
+    # that is there.
+    elif "<think>" in text:
+        text = ""
+
+    # A reasoning preamble in the first sentence.
+    text = _REASONING_PREAMBLE.sub("", text, count=1).strip()
+
+    return text
 
 
 class OllamaVisionAdapter:
@@ -44,13 +70,18 @@ class OllamaVisionAdapter:
         prompt = context or "Describe this image in detail, including any readable text."
         b64 = base64.b64encode(image_bytes).decode("ascii")
         payload = {"model": self.model, "prompt": prompt, "images": [b64], "stream": False}
+        # `think: false` stops the model generating reasoning at all.
+        # Without it, Ollama returns the model's scratchpad inside
+        # `response` for the qwen3.5-family models (minicpm-v4.6 is one),
+        # and that scratchpad was being embedded as document content.
+        payload["think"] = False
         if max_tokens:
             payload["options"] = {"num_predict": max_tokens}
         import httpx  # deferred; see the module header.
 
         resp = httpx.post(f"{self.base_url}/api/generate", json=payload, timeout=self.timeout_seconds)
         resp.raise_for_status()
-        return resp.json().get("response", "").strip()
+        return _clean_model_output(resp.json().get("response", ""))
 
     def health(self) -> bool:
         try:
@@ -99,7 +130,7 @@ class OpenAICompatibleVisionAdapter:
             timeout=self.timeout_seconds,
         )
         resp.raise_for_status()
-        return resp.json()["choices"][0]["message"]["content"].strip()
+        return _clean_model_output(resp.json()["choices"][0]["message"]["content"])
 
     def health(self) -> bool:
         try:
