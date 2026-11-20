@@ -1391,9 +1391,11 @@ class UniversalParser:
         last_exc: Optional[BaseException] = None
         for attempt in range(1, attempts + 1):
             try:
-                return self.vision.describe_image(
+                caption = self.vision.describe_image(
                     img_bytes, mime, context, max_tokens=max_tokens,
                 )
+                log.info("Vision caption succeeded on attempt %d/%d", attempt, attempts)
+                return caption
             except Exception as exc:
                 last_exc = exc
                 if attempt >= attempts or not _is_transient_vision_error(exc):
