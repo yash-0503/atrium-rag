@@ -490,6 +490,9 @@ def _validate(values: Dict[str, str]) -> List[str]:
             )
         else:
             try:
+pytesseract.pytesseract.tesseract_cmd = (
+                    effective.get("TESSERACT_CMD") or pytesseract.pytesseract.tesseract_cmd
+                )
                 pytesseract.get_tesseract_version()
             except Exception as exc:
                 problems.append(
