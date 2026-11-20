@@ -34,7 +34,7 @@ from __future__ import annotations
 import io
 import logging
 import os
-from typing import Optional
+from typing import Optional, Tuple
 
 log = logging.getLogger("ingest.ocr")
 
@@ -303,3 +303,25 @@ def build_ocr_adapter(
     raise RuntimeError(
         f"Unknown OCR_PROVIDER {chosen!r}. Expected 'tesseract' or 'rapidocr'."
     )
+
+
+def probe_ocr(
+    provider: Optional[str] = None,
+    lang: Optional[str] = None,
+    tesseract_cmd: Optional[str] = None,
+) -> Tuple[bool, str]:
+    from atrium.config import env_str
+
+    chosen = (provider or env_str("OCR_PROVIDER") or "tesseract").strip().lower()
+    language = lang or env_str("OCR_LANG") or "eng"
+
+    try:
+        build_ocr_adapter(
+            provider=chosen, lang=language, tesseract_cmd=tesseract_cmd,
+        )
+    except Exception as exc:
+        return False, f"{type(exc).__name__}: {exc}"
+
+    if chosen == "rapidocr":
+        return True, f"rapidocr ({language})"
+    return True, f"tesseract ({language})"

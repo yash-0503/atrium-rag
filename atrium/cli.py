@@ -480,6 +480,27 @@ def _validate(values: Dict[str, str]) -> List[str]:
                 "OCR_PROVIDER=rapidocr requires `pip install atrium-rag[ocr]`",
             )
 
+    if (effective.get("OCR_ENABLED") or "0").strip().lower() == "1" and effective.get("OCR_PROVIDER") == "tesseract":
+        try:
+            import pytesseract
+        except ImportError:
+            problems.append(
+                "OCR_PROVIDER=tesseract requires `pip install atrium-rag[ocr]` "
+                "(or set OCR_PROVIDER=rapidocr)",
+            )
+        else:
+            try:
+                pytesseract.pytesseract.tesseract_cmd = (
+                    effective.get("TESSERACT_CMD") or pytesseract.pytesseract.tesseract_cmd
+                )
+                pytesseract.get_tesseract_version()
+            except Exception as exc:
+                problems.append(
+                    "OCR_PROVIDER=tesseract needs the Tesseract binary on PATH "
+                    f"({type(exc).__name__}: {exc}); install it or set "
+                    "TESSERACT_CMD to its full path",
+                )
+
     # Cross-key: RERANK_ENABLED=1 needs the matching extra.
     if effective.get("RERANK_ENABLED") == "1":
         provider = effective.get("RERANK_PROVIDER", "bge")
@@ -642,6 +663,36 @@ def _probe_embedder_model(values: Dict[str, str]) -> Tuple[bool, str]:
         if hit:
             return True, model
         return False, f"model {model!r} not pulled (available: {sorted(names)})"
+    except Exception as exc:
+        return False, f"{type(exc).__name__}: {exc}"
+
+
+def _plain(text: str) -> str:
+    """Text as rich should print it, not as it should be interpreted.
+
+    A probe detail is plain text, but it can easily contain brackets —
+    `pip install "atrium-rag[ocr]"`, or a list of model names — and
+    rich reads `[ocr]` as a style tag and silently drops it. The
+    command the operator is meant to copy comes out wrong, and the
+    one thing the message exists to say is the one thing it drops.
+    """
+    from rich.markup import escape
+
+    return escape(text)
+
+
+def _probe_ocr(values: Dict[str, str]) -> Tuple[bool, str]:
+    enabled = (values.get("OCR_ENABLED", "0") or "0").strip().lower()
+    if enabled not in ("1", "true", "yes", "on"):
+        return True, "disabled"
+    try:
+        from atrium.ocr_adapter import probe_ocr
+
+        return probe_ocr(
+            provider=values.get("OCR_PROVIDER", ""),
+            lang=values.get("OCR_LANG", ""),
+            tesseract_cmd=values.get("TESSERACT_CMD", "") or None,
+        )
     except Exception as exc:
         return False, f"{type(exc).__name__}: {exc}"
 
@@ -823,7 +874,7 @@ def doctor(
     if problems:
         _err_console().print("[bad]Configuration problems:[/]")
         for p in problems:
-            _err_console().print(f"  [bad]-[/] {p}")
+            _err_console().print(f"  [bad]-[/] {_plain(p)}")
         console.print()
 
     remote_ok = True
@@ -833,6 +884,7 @@ def doctor(
             ("embedder", _probe_embedder),
             ("model", _probe_embedder_model),
             ("vector db", _probe_vector_db),
+            ("ocr", _probe_ocr),
         ):
             ok, detail = probe(effective)
             if ok:
@@ -841,15 +893,27 @@ def doctor(
                 # A store holding vectors of a different length is not
                 # unreachable; it is mismatched, and the fix is different.
                 mark = "[bad]dimension mismatch[/]"
+            elif label == "ocr":
+                mark = "[bad]not usable[/]"
             else:
                 mark = "[bad]unreachable[/]"
-            console.print(f"  {label:<10} {mark}  [dim]{detail}[/]")
+            console.print(f"  {label:<10} {mark}  [dim]{_plain(detail)}[/]")
             if not ok:
                 remote_ok = False
                 if "dim" in detail:
                     console.print(
                         "  [dim]the store holds vectors the model cannot use — "
                         "start a new one (`atrium init`) and re-ingest[/]"
+                    )
+                elif label == "ocr":
+                    console.print(
+                        "  [dim]"
+                        + _plain(
+                            'OCR is enabled but the engine cannot be built, so '
+                            'scanned pages will not be read — install the extra '
+                            '(`pip install "atrium-rag[ocr]"`) or set OCR_ENABLED=0'
+                        )
+                        + "[/]"
                     )
 
     # The local store scans every stored vector on every query, so its

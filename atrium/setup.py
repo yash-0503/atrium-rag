@@ -22,6 +22,7 @@ verification step runs against what was actually written.
 from __future__ import annotations
 
 import json
+import os
 import shutil
 import subprocess
 import sys
@@ -147,6 +148,9 @@ class Environment:
     qdrant_reachable: bool = False
     postgres_reachable: bool = False
     tesseract_installed: bool = False
+    tesseract_binding_installed: bool = False
+    tesseract_cmd: str = ""
+    rapidocr_installed: bool = False
     fastembed_installed: bool = False
     endpoints: List[Endpoint] = field(default_factory=list)
 
@@ -155,6 +159,19 @@ class Environment:
             if endpoint.has(model):
                 return endpoint
         return None
+
+    def ocr_available(self, provider: str) -> bool:
+        chosen = (provider or "tesseract").strip().lower()
+        if chosen == "rapidocr":
+            return self.rapidocr_installed
+        if chosen in ("tesseract", ""):
+            if not self.tesseract_binding_installed:
+                return False
+            if self.tesseract_cmd:
+                # An explicit path: it has to exist and be executable.
+                return os.access(self.tesseract_cmd, os.X_OK)
+            return self.tesseract_installed
+        return False
 
 
 def brand(console, subtitle: str = "") -> None:
@@ -238,6 +255,26 @@ def detect_environment() -> Environment:
             env.qdrant_reachable = False
 
     env.tesseract_installed = _which("tesseract")
+    try:
+        from atrium.config import env_str
+
+        env.tesseract_cmd = (env_str("TESSERACT_CMD") or "").strip()
+    except Exception:
+        env.tesseract_cmd = ""
+
+    try:
+        import pytesseract  # noqa: F401
+
+        env.tesseract_binding_installed = True
+    except ImportError:
+        env.tesseract_binding_installed = False
+
+    try:
+        import rapidocr_onnxruntime  # noqa: F401
+
+        env.rapidocr_installed = True
+    except ImportError:
+        env.rapidocr_installed = False
 
     try:
         import fastembed  # noqa: F401
@@ -450,6 +487,36 @@ def verify(values: Dict[str, str]) -> List[Check]:
             )
         )
 
+    if (values.get("OCR_ENABLED") or "0").strip() in ("1", "true", "yes", "on"):
+        try:
+            from atrium.ocr_adapter import probe_ocr
+
+            ok, detail = probe_ocr(
+                provider=values.get("OCR_PROVIDER", ""),
+                lang=values.get("OCR_LANG", ""),
+                tesseract_cmd=values.get("TESSERACT_CMD", "") or None,
+            )
+        except Exception as exc:
+            ok, detail = False, f"{type(exc).__name__}: {exc}"
+        checks.append(
+            Check(
+                "ocr engine",
+                ok,
+                detail,
+                "Install `atrium-rag[ocr]`, or turn OCR off — with OCR "
+                "enabled but unusable, scanned pages are silently skipped",
+            )
+        )
+    else:
+        checks.append(
+            Check(
+                "ocr engine",
+                True,
+                "disabled — scanned pages will not be read",
+                "Run `atrium init` to enable OCR for scanned pages",
+            )
+        )
+
     return checks
 
 
@@ -559,6 +626,12 @@ def _menu(
 
         return typer.prompt("name", default="").strip()
     return choices[index][0]
+
+
+def _plain(text: str) -> str:
+    from rich.markup import escape
+
+    return escape(text)
 
 
 def _yes_no(console, title: str, default: bool = False, hint: str = "") -> bool:
@@ -762,20 +835,68 @@ class _Wizard:
             "read text from scans and image-only documents",
         ):
             self.set("OCR_ENABLED", "1", "chosen")
-            self.set(
-                "OCR_PROVIDER",
-                _menu(self.console, "OCR engine", OCR_PROVIDERS,
-                      current=self.cur("OCR_PROVIDER", "rapidocr")),
-                "chosen",
+            providers = [
+                (key, hint + ("" if self.env.ocr_available(key) else "  [not installed]"))
+                for key, hint in OCR_PROVIDERS
+            ]
+            provider = _menu(
+                self.console, "OCR engine", providers,
+                current=self.cur("OCR_PROVIDER", "rapidocr"),
             )
+            self.set("OCR_PROVIDER", provider, "chosen")
             self.set(
                 "OCR_LANG",
                 _menu(self.console, "OCR language", OCR_LANGUAGES, allow_other=True,
                       current=self.cur("OCR_LANG", "eng")),
                 "chosen",
             )
+            self._check_ocr_engine(provider)
         else:
             self.set("OCR_ENABLED", "0", "chosen")
+
+    def _check_ocr_engine(self, provider: str) -> None:
+        try:
+            from atrium.ocr_adapter import probe_ocr
+
+            ok, detail = probe_ocr(
+                provider=provider,
+                lang=self.cur("OCR_LANG", "eng"),
+                tesseract_cmd=self.cur("TESSERACT_CMD", "") or None,
+            )
+        except Exception as exc:
+            ok, detail = False, f"{type(exc).__name__}: {exc}"
+        if ok:
+            return
+
+        self.console.print(
+            f"[warn]The {provider} OCR engine cannot be used on this machine:[/] "
+            f"{_plain(detail)}"
+        )
+        others = [key for key, _ in OCR_PROVIDERS if key != provider]
+        for other in others:
+            try:
+                from atrium.ocr_adapter import probe_ocr
+
+                alt_ok, alt_detail = probe_ocr(
+                    provider=other, lang=self.cur("OCR_LANG", "eng"),
+                )
+            except Exception:
+                alt_ok, alt_detail = False, ""
+            if alt_ok:
+                if _yes_no(
+                    self.console,
+                    f"Use {other} instead? ({alt_detail})",
+                    True,
+                    "it works on this machine",
+                ):
+                    self.set("OCR_PROVIDER", other, "chosen")
+                    self.console.print(f"[ok]Using {other} for OCR.[/]")
+                return
+        self.console.print(
+            "[warn]No OCR engine on this machine can be used. Install one with "
+            '`pip install "atrium-rag[ocr]"` (rapidocr needs no binary), or '
+            "run `atrium init` again afterwards.[/]"
+        )
 
     def ask_rerank(self) -> None:
         import typer
@@ -1058,16 +1179,23 @@ def _choose_non_interactive(env: Environment, existing: Dict[str, str], set_valu
         set_value("EMBED_PROVIDER", "fastembed", "detected")
         set_value("EMBED_MODEL", "BAAI/bge-small-en-v1.5", "detected")
         set_value("EMBED_DIM", "384", "detected")
-        return
-    endpoint = env.endpoints[0] if env.endpoints else None
-    set_value("EMBED_PROVIDER", "http", "detected")
-    set_value(
-        "EMBED_BASE_URL",
-        endpoint.base_url if endpoint else "http://localhost:11434/v1",
-        "detected",
-    )
-    set_value("EMBED_MODEL", existing.get("EMBED_MODEL", "bge-large"), "detected")
-    set_value("EMBED_DIM", existing.get("EMBED_DIM", "1024"), "detected")
+    else:
+        endpoint = env.endpoints[0] if env.endpoints else None
+        set_value("EMBED_PROVIDER", "http", "detected")
+        set_value(
+            "EMBED_BASE_URL",
+            endpoint.base_url if endpoint else "http://localhost:11434/v1",
+            "detected",
+        )
+        set_value("EMBED_MODEL", existing.get("EMBED_MODEL", "bge-large"), "detected")
+        set_value("EMBED_DIM", existing.get("EMBED_DIM", "1024"), "detected")
+    for provider in ("rapidocr", "tesseract"):
+        if env.ocr_available(provider):
+            set_value("OCR_ENABLED", "1", "detected")
+            set_value("OCR_PROVIDER", provider, "detected")
+            break
+    else:
+        set_value("OCR_ENABLED", "0", "detected")
 
 
 def _offer_actions(
@@ -1139,6 +1267,62 @@ def _offer_actions(
                 timeout=900,
             ),
         )
+
+    if (values.get("OCR_ENABLED") or "0").strip() in ("1", "true", "yes", "on"):
+        provider = (values.get("OCR_PROVIDER") or "tesseract").strip().lower()
+        if not env.ocr_available(provider):
+            console.print(
+                f"[warn]OCR is enabled with {provider}, but that engine cannot be "
+                f"built on this machine — scanned pages would be skipped.[/]"
+            )
+            if provider == "tesseract":
+                if env.rapidocr_installed:
+                    console.print(
+                        "[dim]Tesseract needs its system binary, which pip "
+                        "cannot install. rapidocr is already installed and "
+                        "needs nothing else — use it instead?[/]"
+                    )
+                    if _yes_no(
+                        console,
+                        "Use rapidocr for OCR instead?",
+                        True,
+                        "pip-only — no binary to install",
+                    ):
+                        values["OCR_PROVIDER"] = "rapidocr"
+                        console.print("[ok]Using rapidocr for OCR.[/]")
+                else:
+                    console.print(
+                        "[dim]Tesseract needs its system binary, which pip "
+                        "cannot install (brew install tesseract / apt install "
+                        "tesseract-ocr). Install rapidocr instead — pip-only, "
+                        "no binary needed?[/]"
+                    )
+                    if _yes_no(
+                        console,
+                        "Install rapidocr for OCR? (pip install \"atrium-rag[ocr]\")",
+                        True,
+                        "pip-only — no binary to install",
+                    ):
+                        try:
+                            subprocess.run(
+                                [sys.executable, "-m", "pip", "install",
+                                 "atrium-rag[ocr]"],
+                                check=True,
+                                timeout=900,
+                            )
+                            values["OCR_PROVIDER"] = "rapidocr"
+                            console.print("[ok]Using rapidocr for OCR.[/]")
+                        except Exception as exc:
+                            console.print(f"[bad]could not:[/] {exc}")
+            else:
+                offer(
+                    'Install the OCR engine? (pip install "atrium-rag[ocr]")',
+                    lambda: subprocess.run(
+                        [sys.executable, "-m", "pip", "install", "atrium-rag[ocr]"],
+                        check=True,
+                        timeout=900,
+                    ),
+                )
 
 
 # ---------------------------------------------------------------------------
