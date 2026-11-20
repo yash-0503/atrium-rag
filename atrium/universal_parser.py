@@ -1400,10 +1400,10 @@ class UniversalParser:
                 last_exc = exc
                 if attempt >= attempts or not _is_transient_vision_error(exc):
                     raise
-                delay = min(base_delay * (2 ** (attempt - 1)), VISION_RETRY_MAX_DELAY)
+                delay = base_delay * (2 ** (attempt - 1))
                 # Jitter, so that a document with many images does not
                 # retry all of them at the same instant.
-                delay *= 0.5 + random.random()
+                delay = min(delay * (0.5 + random.random()), VISION_RETRY_MAX_DELAY)
                 log.info(
                     "Vision caption attempt %d/%d failed (%s: %s); retrying in %.1fs",
                     attempt, attempts, type(exc).__name__, exc, delay,
