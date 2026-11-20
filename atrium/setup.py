@@ -845,7 +845,11 @@ class _Wizard:
         try:
             from atrium.ocr_adapter import probe_ocr
 
-            ok, detail = probe_ocr(provider=provider, lang=self.cur("OCR_LANG", "eng"))
+            ok, detail = probe_ocr(
+                provider=provider,
+                lang=self.cur("OCR_LANG", "eng"),
+                tesseract_cmd=self.cur("TESSERACT_CMD", "") or None,
+            )
         except Exception as exc:
             ok, detail = False, f"{type(exc).__name__}: {exc}"
         if ok:
