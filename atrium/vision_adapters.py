@@ -18,10 +18,9 @@ don't always reliably follow "be brief" instructions on their own.
 from __future__ import annotations
 
 import base64
+import logging
 import re
 from typing import Optional
-import logging
-
 
 DEFAULT_MAX_TOKENS = 1000   # generous default for full transcriptions/standalone images
 log = logging.getLogger("ingest.vision")
