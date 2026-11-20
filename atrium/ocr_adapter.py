@@ -316,7 +316,7 @@ def probe_ocr(
     language = lang or env_str("OCR_LANG") or "eng"
 
     try:
-        adapter = build_ocr_adapter(
+        build_ocr_adapter(
             provider=chosen, lang=language, tesseract_cmd=tesseract_cmd,
         )
     except Exception as exc:
