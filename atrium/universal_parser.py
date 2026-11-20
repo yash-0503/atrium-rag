@@ -1354,7 +1354,9 @@ class UniversalParser:
         def _call(item):
             element, img_bytes, mime, context, digest, truncate_summary, max_tokens = item
             try:
-                caption = self.vision.describe_image(img_bytes, mime, context, max_tokens=max_tokens)
+                caption = self._describe_with_retry(
+                    img_bytes, mime, context, max_tokens,
+                )
             except Exception as e:
                 log.warning("Vision caption failed (%s: %s)", type(e).__name__, e)
                 return element, digest, None
