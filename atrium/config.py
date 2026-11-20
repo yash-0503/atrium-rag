@@ -130,6 +130,8 @@ DEFAULTS: Dict[str, str] = {
     "VISION_ENABLED": "0",
     "VISION_MODEL": "minicpm-v4.6:1b",
     "VISION_TIMEOUT_SECONDS": "180",
+    "VISION_MAX_RETRIES": "2",
+    "VISION_RETRY_BASE_DELAY": "1.0",
     # -- OCR (opt-in: the `ocr` extra is not installed by default) --------
     "OCR_ENABLED": "0",
     "OCR_PROVIDER": "tesseract",

@@ -271,6 +271,8 @@ _MANAGED_BY_RUNTIME: Dict[str, str] = {
     "VISION_ENABLED": "bool",
     "VISION_MODEL": "str",
     "VISION_TIMEOUT_SECONDS": "float",
+    "VISION_MAX_RETRIES": "int",
+    "VISION_RETRY_BASE_DELAY": "float",
     "DENSE_CONFIDENT_GAP": "float",
     "DENSE_MIN_SCORE": "float",
     "RETRIEVAL_LAB_MAX_SESSIONS": "int",

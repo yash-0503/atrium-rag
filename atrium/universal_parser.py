@@ -56,13 +56,15 @@ import hashlib
 import io
 import json
 import logging
+import random
 import re
 import threading
+import time
 from collections import Counter, defaultdict
 from dataclasses import dataclass, field
 from typing import Optional, Protocol
 
-from .config import env_int
+from .config import env_float, env_int
 from .pdf_backend import FLAG_BOLD
 
 # Pillow is imported lazily, inside the function that needs it.
@@ -220,6 +222,35 @@ MAX_JSON_DEPTH = 5
 def _is_monospace(font_name: str) -> bool:
     clean = font_name.lower().replace("-", "").replace("_", "").replace(" ", "")
     return any(m in clean for m in MONO_FONTS)
+
+
+VISION_RETRY_MAX_DELAY = 30.0
+
+
+def _is_transient_vision_error(exc: BaseException) -> bool:
+    try:
+        import httpx
+    except ImportError:  # pragma: no cover - httpx is a hard dependency
+        httpx = None
+
+    if httpx is not None:
+        # A timeout is the model being slow or busy.
+        if isinstance(exc, httpx.TimeoutException):
+            return True
+        # ConnectError and ReadError are both NetworkError subclasses:
+        # the server was not there, or the connection dropped.
+        if isinstance(exc, httpx.NetworkError):
+            return True
+        # A protocol error means the connection was cut mid-response.
+        if isinstance(exc, httpx.ProtocolError):
+            return True
+        # The server answered with a status. 5xx and 429 are its fault
+        # or its load; the other 4xx are ours.
+        if isinstance(exc, httpx.HTTPStatusError):
+            status = exc.response.status_code
+            return status == 429 or status >= 500
+
+    return False
 
 
 def _clean_glyph_noise(text: str) -> str:
@@ -1323,7 +1354,9 @@ class UniversalParser:
         def _call(item):
             element, img_bytes, mime, context, digest, truncate_summary, max_tokens = item
             try:
-                caption = self.vision.describe_image(img_bytes, mime, context, max_tokens=max_tokens)
+                caption = self._describe_with_retry(
+                    img_bytes, mime, context, max_tokens,
+                )
             except Exception as e:
                 # Was silently swallowed before, which made caption problems undiagnosable.
                 log.warning("Vision caption failed (%s: %s)", type(e).__name__, e)
@@ -1348,6 +1381,41 @@ class UniversalParser:
                     self._vision_cache[digest] = caption
 
         self._parse_state()["pending"] = []
+
+    def _describe_with_retry(self, img_bytes: bytes, mime: str,
+                             context: Optional[str],
+                             max_tokens: Optional[int]) -> str:
+        attempts = max(1, env_int("VISION_MAX_RETRIES", 2) + 1)
+        base_delay = max(0.0, env_float("VISION_RETRY_BASE_DELAY", 1.0))
+
+        last_exc: Optional[BaseException] = None
+        for attempt in range(1, attempts + 1):
+            try:
+                return self.vision.describe_image(
+                    img_bytes, mime, context, max_tokens=max_tokens,
+                )
+            except Exception as exc:
+                last_exc = exc
+                if attempt >= attempts or not _is_transient_vision_error(exc):
+                    if attempt > 1:
+                        log.warning(
+                            "Vision caption failed after %d attempt(s) (%s: %s)",
+                            attempt, type(exc).__name__, exc,
+                        )
+                    raise
+                delay = min(base_delay * (2 ** (attempt - 1)), VISION_RETRY_MAX_DELAY)
+                # Jitter, so that a document with many images does not
+                # retry all of them at the same instant.
+                delay *= 0.5 + random.random()
+                log.info(
+                    "Vision caption attempt %d/%d failed (%s: %s); retrying in %.1fs",
+                    attempt, attempts, type(exc).__name__, exc, delay,
+                )
+                time.sleep(delay)
+
+        # Unreachable: the loop either returns or raises. The re-raise
+        # keeps the original error rather than a bare "gave up".
+        raise last_exc  # pragma: no cover
 
     @staticmethod
     def _truncate_caption(text: str, max_sentences: int = CAPTION_MAX_SENTENCES) -> str:
