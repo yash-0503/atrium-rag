@@ -20,43 +20,50 @@ from __future__ import annotations
 import base64
 import re
 from typing import Optional
+import logging
 
-# `httpx` is imported lazily, inside the methods that make a request.
-# It costs ~48 ms to import — more than this whole module — and a
-# deployment that never captions an image (no VISION_ENABLED, no
-# vision-capable document) should not pay for it at boot.
 
 DEFAULT_MAX_TOKENS = 1000   # generous default for full transcriptions/standalone images
+log = logging.getLogger("ingest.vision")
 
-_REASONING_PREAMBLE = re.compile(
-    r"^\s*(okay|ok|alright|hmm|well|got it|let'?s|let me|i need to|i think|"
-    r"i'?ll|we need to|we have|we must|we can|the user|the prompt)\b[^.]*\.\s*",
+
+class VisionError(RuntimeError):
+    """The model did not produce a usable caption."""
+_THINK_RE = re.compile(r"<think(?:ing)?>.*?</think(?:ing)?>", re.DOTALL | re.IGNORECASE)
+_CLOSE_RE = re.compile(r"</think(?:ing)?>", re.IGNORECASE)
+_OPEN_RE = re.compile(r"<think(?:ing)?>", re.IGNORECASE)
+
+# Untagged reasoning openers. Used ONLY to log a warning, never to edit text.
+_REASONING_HINT_RE = re.compile(
+    r"^\s*(okay|ok,|let me|let's|first,|i need to|i should|hmm|so,|the user)",
     re.IGNORECASE,
 )
 
+_SYSTEM = ("You are an image captioning component. Output ONLY the final "
+           "caption or transcription. No reasoning, no preamble, no commentary.")
+
 
 def _clean_model_output(text: str) -> str:
-    text = (text or "").strip()
+    """Strip tagged reasoning. Raises instead of returning "" so a failure
+    can never be mistaken for an empty-but-valid caption."""
+    raw = (text or "").strip()
+    text = _THINK_RE.sub("", raw)
+    closes = list(_CLOSE_RE.finditer(text))
+    if closes:
+        text = text[closes[-1].end():]
+    if _OPEN_RE.search(text):
+        raise VisionError("output was only reasoning (truncated before the answer)")
+    text = text.strip()
     if not text:
-        return ""
-
-    # A complete reasoning block: keep what follows it.
-    if "</think>" in text:
-        text = text.split("</think>", 1)[1].strip()
-    # An unterminated one: keep nothing, because the reasoning is all
-    # that is there.
-    elif "<think>" in text:
-        text = ""
-
-    # A reasoning preamble in the first sentence.
-    text = _REASONING_PREAMBLE.sub("", text, count=1).strip()
-
+        raise VisionError("model returned an empty caption")
+    if _REASONING_HINT_RE.match(text):
+        # Can't be fixed by parsing; surface it so the trigger can be found.
+        log.warning("vision output looks like untagged reasoning: %.200r", text)
     return text
 
 
 class OllamaVisionAdapter:
-    """Local, offline vision captioning via Ollama (e.g. llava, qwen2-vl,
-    minicpm-v). No API key, no external network call."""
+    """Local vision captioning via Ollama's /api/chat."""
 
     def __init__(self, model: str = "llava", base_url: str = "http://localhost:11434",
                  timeout_seconds: float = 60.0):
@@ -64,24 +71,47 @@ class OllamaVisionAdapter:
         self.base_url = base_url.rstrip("/")
         self.timeout_seconds = timeout_seconds
 
-    def describe_image(self, image_bytes: bytes, mimetype: str,
-                        context: Optional[str] = None,
-                        max_tokens: Optional[int] = None) -> str:
-        prompt = context or "Describe this image in detail, including any readable text."
-        b64 = base64.b64encode(image_bytes).decode("ascii")
-        payload = {"model": self.model, "prompt": prompt, "images": [b64], "stream": False}
-        # `think: false` stops the model generating reasoning at all.
-        # Without it, Ollama returns the model's scratchpad inside
-        # `response` for the qwen3.5-family models (minicpm-v4.6 is one),
-        # and that scratchpad was being embedded as document content.
-        payload["think"] = False
-        if max_tokens:
-            payload["options"] = {"num_predict": max_tokens}
+    def _chat(self, b64: str, prompt: str, num_predict: Optional[int]) -> dict:
         import httpx  # deferred; see the module header.
 
-        resp = httpx.post(f"{self.base_url}/api/generate", json=payload, timeout=self.timeout_seconds)
+        options = {"temperature": 0}
+        if num_predict:
+            options["num_predict"] = num_predict
+        resp = httpx.post(
+            f"{self.base_url}/api/chat",
+            json={
+                "model": self.model,
+                "stream": False,
+                "think": False,
+                "options": options,
+                "messages": [
+                    {"role": "system", "content": _SYSTEM},
+                    {"role": "user", "content": prompt, "images": [b64]},
+                ],
+            },
+            timeout=self.timeout_seconds,
+        )
         resp.raise_for_status()
-        return _clean_model_output(resp.json().get("response", ""))
+        return resp.json()
+
+    def describe_image(self, image_bytes: bytes, mimetype: str,
+                       context: Optional[str] = None,
+                       max_tokens: Optional[int] = None) -> str:
+        prompt = context or "Describe this image in detail, including any readable text."
+        b64 = base64.b64encode(image_bytes).decode("ascii")
+        budget = max_tokens
+
+        for attempt in (1, 2):
+            data = self._chat(b64, prompt, budget)
+            content = (data.get("message") or {}).get("content") or ""  # never "thinking"
+            try:
+                return _clean_model_output(content)
+            except VisionError:
+                # Truncated with a cap set: retry once with more room.
+                if attempt == 1 and budget and data.get("done_reason") == "length":
+                    budget *= 4
+                    continue
+                raise
 
     def health(self) -> bool:
         try:
