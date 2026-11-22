@@ -357,6 +357,18 @@ def test_common_vision_queue_uses_ocr_before_vision():
     assert parser._parse_state()["pending"] == []
 
 
+def test_common_vision_queue_does_not_retain_original_after_ocr():
+    ocr = MagicMock()
+    ocr.transcribe.return_value = "x"
+    vision = MagicMock()
+    parser = UniversalParser(vision_adapter=vision, ocr_adapter=ocr)
+    element = _element("")
+
+    parser._queue_vision_caption(element, b"full-resolution-image", "image/png")
+
+    assert parser._parse_state()["pending"][0][1] is None
+
+
 def test_concurrent_reingest_of_one_document_leaves_one_version(local_store):
     """Two ingests of the same document at the same time used to delete
     each other's chunks, leaving a mix of two versions."""

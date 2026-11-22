@@ -1475,11 +1475,11 @@ class UniversalParser:
             return
 
         state["calls"] += 1
-        # The original bytes travel with the item so the OCR fallback
-        # reads the full-resolution image, and the OCR text so a
-        # fallback does not have to run OCR a second time.
+        # Keep originals only when OCR has not already supplied a result;
+        # otherwise the queued item retains only the downscaled bytes.
+        fallback_bytes = image_bytes if ocr_text is None else None
         state["pending"].append(
-            (element, image_bytes, downscaled_bytes, downscaled_mime, context, digest,
+            (element, fallback_bytes, downscaled_bytes, downscaled_mime, context, digest,
              truncate_summary, max_tokens, ocr_text)
         )
 
