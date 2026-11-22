@@ -668,7 +668,10 @@ class UniversalParser:
     @staticmethod
     def _ocr_page_is_usable(text: str) -> bool:
         t = "".join((text or "").split())
-        return len(t) >= SCANNED_PAGE_MIN_OCR_CHARS
+        return (
+            len(t) >= SCANNED_PAGE_MIN_OCR_CHARS
+            and sum(c.isalnum() for c in t) / len(t) >= 0.6
+        )
 
     def _parse_pdf_page(self, page, page_num: int, heading_levels: dict,
                          body_font_size: float, page_texts_by_band: dict,
