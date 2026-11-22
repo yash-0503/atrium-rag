@@ -1443,6 +1443,18 @@ class UniversalParser:
                               context: Optional[str] = None, truncate_summary: bool = True,
                               max_tokens: Optional[int] = None,
                               ocr_text: Optional[str] = None) -> None:
+        if ocr_text is None and self.ocr:
+            try:
+                ocr_text = self.ocr.transcribe(image_bytes)
+            except Exception as exc:
+                log.warning("OCR attempt failed (%s: %s)", type(exc).__name__, exc)
+                ocr_text = ""
+            if self._ocr_text_is_usable(ocr_text):
+                element.type = "paragraph"
+                element.text = ocr_text
+                return
+            ocr_text = ocr_text or ""
+
         if not self.vision:
             element.text = ""
             element.skipped_reason = "no_vision_adapter"

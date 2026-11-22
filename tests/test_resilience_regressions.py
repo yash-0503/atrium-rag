@@ -342,6 +342,21 @@ def test_ocr_fallback_does_not_repeat_attempted_empty_ocr():
     ocr.transcribe.assert_called_once_with(b"image")
 
 
+def test_common_vision_queue_uses_ocr_before_vision():
+    ocr = MagicMock()
+    ocr.transcribe.return_value = "Readable OCR text " * 3
+    vision = MagicMock()
+    parser = UniversalParser(vision_adapter=vision, ocr_adapter=ocr)
+    element = _element("")
+
+    parser._queue_vision_caption(element, b"image", "image/png")
+
+    ocr.transcribe.assert_called_once_with(b"image")
+    assert element.type == "paragraph"
+    assert element.text == "Readable OCR text " * 3
+    assert parser._parse_state()["pending"] == []
+
+
 def test_concurrent_reingest_of_one_document_leaves_one_version(local_store):
     """Two ingests of the same document at the same time used to delete
     each other's chunks, leaving a mix of two versions."""
