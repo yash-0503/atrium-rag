@@ -89,7 +89,7 @@ dependencies = [
     "pillow>=10.0.0",
     "rich>=13.0.0",
     "striprtf>=0.0.26",
-    "xlrd>=1.2.0,<2.0",   # 2.0+ dropped .xls support
+    "xlrd>=1.2.0,<3.0",   # 2.0+ dropped .xls support
     "odfpy>=1.4.0",
 ]
 
