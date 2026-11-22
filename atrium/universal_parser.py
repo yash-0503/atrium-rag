@@ -743,7 +743,7 @@ class UniversalParser:
             # vision model only gets the page when OCR returns
             # nothing usable - it can transcribe a page AND describe
             # a chart on it, which OCR cannot.
-            ocr_text = self.ocr.transcribe(png_bytes) if self.ocr else ""
+            ocr_text = self.ocr.transcribe(png_bytes) if self.ocr else None
             if self._ocr_page_is_usable(ocr_text):
                 element.type = "paragraph"
                 element.text = ocr_text
@@ -941,7 +941,7 @@ class UniversalParser:
                 continue
 
             # Try OCR before sending the image to vision.
-            ocr_text = ""
+            ocr_text = None
             if self.ocr:
                 ocr_text = self.ocr.transcribe(image_bytes)
                 if self._ocr_text_is_usable(ocr_text):
@@ -1442,7 +1442,7 @@ class UniversalParser:
     def _queue_vision_caption(self, element: ParsedElement, image_bytes: bytes, mimetype: str,
                               context: Optional[str] = None, truncate_summary: bool = True,
                               max_tokens: Optional[int] = None,
-                              ocr_text: str = "") -> None:
+                              ocr_text: Optional[str] = None) -> None:
         if not self.vision:
             element.text = ""
             element.skipped_reason = "no_vision_adapter"
@@ -1511,7 +1511,7 @@ class UniversalParser:
         self._parse_state()["pending"] = []
 
     def _ocr_fallback(self, element: ParsedElement,
-                      image_bytes: Optional[bytes], ocr_text: str = "") -> bool:
+                      image_bytes: Optional[bytes], ocr_text: Optional[str] = None) -> bool:
         """Recover content the vision model could not read.
 
         The vision call failed, but the content is still on the page.
@@ -1524,7 +1524,7 @@ class UniversalParser:
         """
         if not image_bytes or not self.ocr:
             return False
-        if not ocr_text:
+        if ocr_text is None:
             try:
                 ocr_text = self.ocr.transcribe(image_bytes)
             except Exception as exc:

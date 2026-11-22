@@ -329,6 +329,19 @@ def test_reingesting_the_same_document_does_not_duplicate_chunks(local_store):
     assert len(stored) <= 2
 
 
+def test_ocr_fallback_does_not_repeat_attempted_empty_ocr():
+    ocr = MagicMock()
+    ocr.transcribe.return_value = ""
+    parser = UniversalParser(ocr_adapter=ocr)
+    element = _element("")
+
+    assert parser._ocr_fallback(element, b"image", "") is False
+    ocr.transcribe.assert_not_called()
+
+    assert parser._ocr_fallback(element, b"image", None) is False
+    ocr.transcribe.assert_called_once_with(b"image")
+
+
 def test_concurrent_reingest_of_one_document_leaves_one_version(local_store):
     """Two ingests of the same document at the same time used to delete
     each other's chunks, leaving a mix of two versions."""
