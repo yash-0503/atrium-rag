@@ -169,6 +169,9 @@ MIN_IMAGE_DISPLAY_PT = 60                # pt (~0.83in); PDF icon filter, measur
                                           # not raw embedded pixel dimensions (the two can differ enormously —
                                           # see universal_parser docs/commit notes on get_image_rects)
 SCANNED_PAGE_ABS_TEXT_CHARS = 40         # absolute extractable chars below which a page is a real scan
+# A page's OCR output below this many characters is treated as a blank
+# page rather than as the page's content.
+SCANNED_PAGE_MIN_OCR_CHARS = 10
 HEADER_FOOTER_BAND = 0.08                # top/bottom 8% of page height
 HEADER_FOOTER_MIN_PAGE_FRACTION = 0.6    # must repeat on >=60% of pages to be stripped
 
@@ -662,6 +665,14 @@ class UniversalParser:
         t = "".join((text or "").split())
         return len(t) >= 30 and sum(c.isalnum() for c in t) / len(t) >= 0.6
 
+    @staticmethod
+    def _ocr_page_is_usable(text: str) -> bool:
+        t = "".join((text or "").split())
+        return (
+            len(t) >= SCANNED_PAGE_MIN_OCR_CHARS
+            and sum(c.isalnum() for c in t) / len(t) >= 0.6
+        )
+
     def _parse_pdf_page(self, page, page_num: int, heading_levels: dict,
                          body_font_size: float, page_texts_by_band: dict,
                          raw_elements: list[ParsedElement],
@@ -726,21 +737,25 @@ class UniversalParser:
                                      page=page_num)
             raw_elements.append(element)
             png_bytes = page.render_png(150)
-            if self.vision:
+            # OCR first. OCRing a 150-dpi page render is exact and
+            # takes under a second; a vision call for the same page
+            # takes seconds and may mis-transcribe small print. The
+            # vision model only gets the page when OCR returns
+            # nothing usable - it can transcribe a page AND describe
+            # a chart on it, which OCR cannot.
+            ocr_text = self.ocr.transcribe(png_bytes) if self.ocr else None
+            if self._ocr_page_is_usable(ocr_text):
+                element.type = "paragraph"
+                element.text = ocr_text
+            elif self.vision:
                 context = (f"Full scanned page {page_num}. Transcribe all readable text, in reading "
-                          f"order, and describe any charts or diagrams present.")
+                           f"order, and describe any charts or diagrams present.")
                 self._queue_vision_caption(element, png_bytes, "image/png", context=context,
-                                            truncate_summary=False)
+                                            truncate_summary=False, ocr_text=ocr_text)
             elif self.ocr:
-                # OCR fallback. Synchronous: page is sequential, and OCR
-                # on a 150-dpi page is sub-second — no benefit to batching.
-                text = self.ocr.transcribe(png_bytes)
-                if text:
-                    element.type = "paragraph"
-                    element.text = text
-                else:
-                    element.text = ""
-                    element.skipped_reason = "ocr_returned_no_text"
+                # OCR ran and found nothing usable.
+                element.text = ""
+                element.skipped_reason = "ocr_returned_no_text"
             else:
                 element.text = ""
                 element.skipped_reason = "no_vision_or_ocr_adapter"
@@ -926,6 +941,7 @@ class UniversalParser:
                 continue
 
             # Try OCR before sending the image to vision.
+            ocr_text = None
             if self.ocr:
                 ocr_text = self.ocr.transcribe(image_bytes)
                 if self._ocr_text_is_usable(ocr_text):
@@ -953,6 +969,7 @@ class UniversalParser:
                 context=CAPTION_PROMPT,
                 truncate_summary=True,
                 max_tokens=DIAGRAM_CAPTION_MAX_TOKENS,
+                ocr_text=ocr_text,
             )
 
         return carry_paragraph
@@ -1424,7 +1441,20 @@ class UniversalParser:
 
     def _queue_vision_caption(self, element: ParsedElement, image_bytes: bytes, mimetype: str,
                               context: Optional[str] = None, truncate_summary: bool = True,
-                              max_tokens: Optional[int] = None) -> None:
+                              max_tokens: Optional[int] = None,
+                              ocr_text: Optional[str] = None) -> None:
+        if ocr_text is None and self.ocr:
+            try:
+                ocr_text = self.ocr.transcribe(image_bytes)
+            except Exception as exc:
+                log.warning("OCR attempt failed (%s: %s)", type(exc).__name__, exc)
+                ocr_text = ""
+            if self._ocr_text_is_usable(ocr_text):
+                element.type = "paragraph"
+                element.text = ocr_text
+                return
+            ocr_text = ocr_text or ""
+
         if not self.vision:
             element.text = ""
             element.skipped_reason = "no_vision_adapter"
@@ -1445,8 +1475,12 @@ class UniversalParser:
             return
 
         state["calls"] += 1
+        # Keep originals only when OCR has not already supplied a result;
+        # otherwise the queued item retains only the downscaled bytes.
+        fallback_bytes = image_bytes if ocr_text is None else None
         state["pending"].append(
-            (element, downscaled_bytes, downscaled_mime, context, digest, truncate_summary, max_tokens)
+            (element, fallback_bytes, downscaled_bytes, downscaled_mime, context, digest,
+             truncate_summary, max_tokens, ocr_text)
         )
 
     def _resolve_pending_vision(self) -> None:
@@ -1458,27 +1492,62 @@ class UniversalParser:
             return
 
         def _call(item):
-            element, img_bytes, mime, context, digest, truncate_summary, max_tokens = item
+            (element, original_bytes, vision_bytes, mime, context, digest,
+             truncate_summary, max_tokens, ocr_text) = item
             try:
                 caption = self._describe_with_retry(
-                    img_bytes, mime, context, max_tokens,
+                    vision_bytes, mime, context, max_tokens,
                 )
             except Exception as e:
                 log.warning("Vision caption failed (%s: %s)", type(e).__name__, e)
-                element.skipped_reason = "vision_call_failed"
+                # The image comes back with the failure so the OCR
+                # fallback can recover the content.
+                return element, digest, None, original_bytes, ocr_text
             if truncate_summary:
                 caption = self._truncate_caption(caption)
-            return element, digest, caption
+            return element, digest, caption, None, ""
 
         with concurrent.futures.ThreadPoolExecutor(max_workers=self.vision_concurrency) as pool:
-            for element, digest, caption in pool.map(_call, pending):
+            for element, digest, caption, failed_bytes, ocr_text in pool.map(_call, pending):
                 if caption is None:
-                    element.text = ""      # dropped in parse(); never cached
+                    # A failed vision call must not lose the content.
+                    # OCR reads the same page exactly, and costs a
+                    # fraction of a vision call.
+                    if not self._ocr_fallback(element, failed_bytes, ocr_text):
+                        element.text = ""      # dropped in parse(); never cached
+                        element.skipped_reason = "vision_call_failed"
                     continue
                 element.text = caption
                 self._vision_cache[digest] = caption
 
         self._parse_state()["pending"] = []
+
+    def _ocr_fallback(self, element: ParsedElement,
+                      image_bytes: Optional[bytes], ocr_text: Optional[str] = None) -> bool:
+        """Recover content the vision model could not read.
+
+        The vision call failed, but the content is still on the page.
+        OCR reads it exactly and costs a fraction of a vision call, so
+        a failed caption becomes a recovered page rather than a lost
+        one. `ocr_text` is what OCR already read from this image, if
+        anything, so the fallback does not run OCR twice.
+
+        Returns whether the content was recovered.
+        """
+        if not image_bytes or not self.ocr:
+            return False
+        if ocr_text is None:
+            try:
+                ocr_text = self.ocr.transcribe(image_bytes)
+            except Exception as exc:
+                log.warning("OCR fallback failed (%s: %s)", type(exc).__name__, exc)
+                return False
+        if not self._ocr_text_is_usable(ocr_text):
+            return False
+        element.type = "paragraph"
+        element.text = ocr_text
+        element.skipped_reason = None
+        return True
 
     def _describe_with_retry(self, img_bytes: bytes, mime: str,
                              context: Optional[str],
