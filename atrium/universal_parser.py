@@ -849,7 +849,8 @@ class UniversalParser:
                 paragraph_run.clear()
                 if not assembled_text or len(assembled_text) <= 2:
                     return
-                if carry_paragraph and carry_paragraph.type == "paragraph":
+                if carry_paragraph and carry_paragraph.type == "paragraph" \
+                        and self._same_column(carry_paragraph.bbox, bbox, page_rect.width):
                     carry_paragraph = ParsedElement(
                         type="paragraph",
                         text=carry_paragraph.text.rstrip() + " " + assembled_text,
@@ -961,6 +962,31 @@ class UniversalParser:
         if carry_paragraph:
             raw_elements.append(carry_paragraph)
         return None
+
+    @staticmethod
+    def _same_column(carry_bbox: Optional[tuple], bbox: Optional[tuple],
+                     page_width: float) -> bool:
+        """Whether two blocks sit in the same column of the page.
+
+        A paragraph that runs on from one column into the next is two
+        paragraphs: the last one of the left column and the first one
+        of the right. Merging them splices two unrelated texts
+        together, so the carry is closed at the column boundary
+        instead.
+
+        A block that is far taller than it is wide is a vertical run of
+        text — a margin stamp, a sideways label — and is never part of
+        the paragraph flow.
+        """
+        if not carry_bbox or not bbox:
+            return True
+        for box in (carry_bbox, bbox):
+            width = float(box[2]) - float(box[0])
+            height = float(box[3]) - float(box[1])
+            if height > 50.0 and width > 0 and height > width * 2.0:
+                return False  # a vertical run of text, not a paragraph
+        midpoint = page_width / 2.0
+        return (float(carry_bbox[0]) < midpoint) == (float(bbox[0]) < midpoint)
 
     @staticmethod
     def _join_lines(lines: list[str]) -> str:
@@ -1077,16 +1103,96 @@ class UniversalParser:
         if len(items) <= 1:
             return items
 
-        x_starts = sorted(item[2][0] for item in items)
-        gaps = [(a + b) / 2 for a, b in zip(x_starts, x_starts[1:]) if b - a > page_width * 0.04]
-
-        if not gaps:
+        boundary = self._choose_column_boundary(items, page_width)
+        if boundary is None:
             return sorted(items, key=lambda item: (item[2][1], item[2][0]))
 
-        boundary = max(gaps)
         left = sorted((item for item in items if item[2][0] < boundary), key=lambda item: item[2][1])
         right = sorted((item for item in items if item[2][0] >= boundary), key=lambda item: item[2][1])
         return left + right
+
+    @staticmethod
+    def _choose_column_boundary(items: list[tuple[str, object, tuple]],
+                                 page_width: float) -> Optional[float]:
+        """Pick the column gutter, not the widest whitespace run.
+
+        Taking `max(gaps)` over block start positions picks the largest
+        horizontal whitespace on the page, which on a two-column page is
+        usually a stray artefact (a page number, a full-width figure) and
+        not the gutter. Splitting there leaves one block on one side, so
+        the page falls back to sorting by y alone and the two columns
+        interleave row by row.
+
+        Two kinds of candidate are scored instead:
+
+        * the horizontal bands no block covers — the real gutter, when
+          the backend reports per-column geometry;
+        * the gaps between clusters of block start positions — the only
+          signal left when the backend has already fused the columns.
+
+        A candidate is kept only when it looks like two real columns:
+        enough blocks on both sides, the sides overlapping vertically,
+        and the right side not being centred headings that straddle the
+        middle of the page.
+        """
+        n = len(items)
+        min_count = max(2, int(n * 0.15))
+        x0s = [item[2][0] for item in items]
+        content_mid = (min(x0s) + max(item[2][2] for item in items)) / 2.0
+        page_mid = page_width / 2.0
+
+        # Free horizontal bands: x ranges no block covers.
+        bands: list[tuple[float, float]] = []
+        reach: Optional[float] = None
+        for x0, x1 in sorted((item[2][0], item[2][2]) for item in items):
+            if reach is None:
+                reach = x1
+            elif x0 > reach:
+                bands.append((reach, x0))
+                reach = x1
+            else:
+                reach = max(reach, x1)
+
+        candidates: list[tuple[float, bool]] = []
+        for band_start, band_end in bands:
+            if band_end - band_start >= max(2.0, page_width * 0.01):
+                candidates.append(((band_start + band_end) / 2.0, True))
+        x_starts = sorted(x0s)
+        for a, b in zip(x_starts, x_starts[1:]):
+            if b - a > page_width * 0.04:
+                candidates.append(((a + b) / 2.0, False))
+
+        best: Optional[tuple[tuple[float, int, float], float]] = None
+        for gap, from_gutter in candidates:
+            left = [item for item in items if item[2][0] < gap]
+            right = [item for item in items if item[2][0] >= gap]
+            if len(left) < min_count or len(right) < min_count:
+                continue  # one side is a stray block, not a column
+
+            # Centred headings straddle the middle of the page; a right
+            # column starts after it. Without this test a single-column
+            # page of centred titles splits into two bogus columns.
+            straddling = sum(1 for item in right if item[2][0] < page_mid < item[2][2])
+            if straddling > len(right) * 0.3:
+                continue
+
+            # Columns run down the page side by side, so their vertical
+            # extents must overlap; without that this is an indent, not a
+            # second column.
+            left_top = min(item[2][1] for item in left)
+            left_bottom = max(item[2][3] for item in left)
+            right_top = min(item[2][1] for item in right)
+            right_bottom = max(item[2][3] for item in right)
+            if left_bottom < right_top or right_bottom < left_top:
+                continue
+
+            balance = min(len(left), len(right)) / max(len(left), len(right))
+            distance = abs(gap - content_mid) / max(1.0, page_width)
+            score = (balance, 1 if from_gutter else 0, -distance)
+            if best is None or score > best[0]:
+                best = (score, gap)
+
+        return best[1] if best else None
 
     # -- tables: ruled-line first, whitespace-column fallback second ----
 

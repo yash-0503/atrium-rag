@@ -89,6 +89,54 @@ _MONO_HINTS = (
 
 _BOLD_HINTS = ("bold", "black", "heavy", "semibold", "demibold", "extrabold", "ultrabold")
 
+# -- pdfplumber word and column detection -----------------------------------
+#
+# pdfminer has no page-layout model: it groups characters by baseline
+# only, so text at the same height in two columns comes back as ONE
+# line spanning the full page width. PyMuPDF's structured-text device
+# does a layout analysis and never lets a block cross a column gutter.
+#
+# The gutter, however, is just whitespace, and whitespace is measurable
+# from the character boxes pdfminer already reports. These constants
+# drive that measurement.
+
+# pdfminer's own word segmentation. Its default of 3.0pt is too loose
+# for a LaTeX PDF, where words are positioned rather than separated by
+# space glyphs: at 3.0pt a whole line merges into one "word". At 2.0pt
+# the segmentation matches PyMuPDF's on the same page.
+WORD_X_TOLERANCE = 2.0
+
+# pdfminer's default line-clustering tolerance, in points.
+LINE_Y_TOLERANCE = 3.0
+
+# A gap wider than this is a column gutter rather than a space.
+# column gutter rather than a space. Measured on the corpus: the gutter
+# between two columns is about seven times the space between two
+# words, while a full-width paragraph never exceeds twice it.
+GUTTER_MIN_GAP_PT = 8.0
+
+# The vertical whitespace profile is computed on horizontal strips of
+# this height. A strip that holds any text counts as a "text row".
+COLUMN_ROW_PT = 2.0
+
+# A column of the page is a gutter when it holds text on at most this
+# fraction of the text rows. Some slack is needed because a full-width
+# title, an abstract or an equation crosses the gutter on a few rows.
+COLUMN_MAX_COVERAGE = 0.25
+
+# A gutter narrower than this fraction of the page width is noise.
+COLUMN_MIN_WIDTH_FRAC = 0.010
+
+# Both sides of a gutter must carry real text: this share of the page's
+# characters, and at least this many. Without it a page margin or a
+# stray indented block reads as a column.
+COLUMN_MIN_CHAR_SHARE = 0.15
+COLUMN_MIN_CHARS = 20
+
+# At most this many column splits per page.
+COLUMN_MAX_SPLITS = 3
+
+
 
 @dataclass
 class PdfSpan:
@@ -372,92 +420,269 @@ class PdfPlumberBackend:
         here, by geometry: consecutive lines that start at roughly the
         same left edge and are not separated by a vertical gap.
 
-        A line is a run of characters, and a span is a run of
-        characters in one font at one size — the same subdivision
-        PyMuPDF reports.
+        Three things make this match PyMuPDF closely.
+
+        **Words come from pdfminer's own segmentation**, not from a
+        local gap rule. A PDF stores glyphs and their positions, not
+        the spaces between them, so the spaces have to be put back;
+        pdfminer already does that, and doing it again with a local
+        threshold is what corrupted word boundaries before.
+
+        **Text is split per column.** pdfminer groups characters by
+        baseline with no notion of a column, so on a two-column page
+        it returns one line holding both columns. The gutter between
+        them is whitespace, and whitespace is measurable, so the page
+        is cut at its gutters before the text is read.
+
+        A line is only cut at a gutter when the gap there really is a
+        gutter. A title page has a full-width abstract above a
+        two-column body, and cutting the abstract at the gutter would
+        tear one paragraph in half.
         """
-        try:
-            raw_lines = page.extract_text_lines(return_chars=True) or []
-        except Exception:
-            raw_lines = []
+        words = self._words(page)
+        if not words:
+            return []
+        chars = self._chars(page)
+        bands = self._column_bands(chars, page)
 
-        lines: list[PdfLine] = []
-        for raw in raw_lines:
-            chars = raw.get("chars") or []
-            spans = self._spans_from_chars(chars)
-            if not spans:
-                text = str(raw.get("text", "") or "")
-                if not text.strip():
-                    continue
-                spans = [
-                    PdfSpan(
-                        text=text,
-                        bbox=(
-                            float(raw.get("x0", 0)),
-                            float(raw.get("top", 0)),
-                            float(raw.get("x1", 0)),
-                            float(raw.get("bottom", 0)),
-                        ),
-                        size=float(raw.get("size", 10.0) or 10.0),
-                        font=str(raw.get("fontname", "") or ""),
-                        flags=_flags_for(str(raw.get("fontname", "") or "")),
-                    )
-                ]
-            lines.append(
-                PdfLine(
-                    bbox=(
-                        float(raw.get("x0", 0)),
-                        float(raw.get("top", 0)),
-                        float(raw.get("x1", 0)),
-                        float(raw.get("bottom", 0)),
-                    ),
-                    spans=spans,
-                )
-            )
+        all_lines = self._word_lines(words)
+        segments: list[list[dict]] = []
+        for line in all_lines:
+            segments.extend(_split_at_gutters(line, bands))
 
-        return self._group_lines_into_blocks(lines)
+        blocks: list[PdfBlock] = []
+        for band in bands:
+            band_words: list[dict] = []
+            for segment in segments:
+                centre = (float(segment[0]["x0"]) + float(segment[-1]["x1"])) / 2.0
+                if band[0] <= centre < band[1]:
+                    band_words.extend(segment)
+            if not band_words:
+                continue
+            lines = self._lines_from_words(band_words)
+            blocks.extend(self._group_lines_into_blocks(lines))
+        return blocks
 
     @staticmethod
-    def _spans_from_chars(chars: list[dict]) -> list[PdfSpan]:
-        """Split a line's characters into spans of one font and size.
+    def _chars(page: Any) -> list[dict]:
+        """The page's characters, in reading order."""
+        try:
+            return page.chars or []
+        except Exception:
+            return []
 
-        The characters have to be reassembled with their spaces. A PDF
-        stores glyphs and their positions, not the space characters
-        between them: pdfminer reports each glyph with its box and the
-        gap to the next one. Joining the glyph texts directly gives
-        "BERT:Pre-trainingofDeep" with no spaces at all, which breaks
-        the token alignment against the canonical text and leaves every
-        chunk unreadable.
+    @staticmethod
+    def _words(page: Any) -> list[dict]:
+        """pdfminer's word segmentation, with the font attributes attached.
 
-        A space is therefore inserted wherever the horizontal gap
-        between two glyphs is wider than a space would be.
+        The font name and size come along so a word can be grouped into
+        a span; pdfminer reports no style flags, so those still come
+        from the font name.
         """
-        spans: list[PdfSpan] = []
-        for group in _group_by(
-            chars,
-            lambda c: (
-                str(c.get("fontname", "") or ""),
-                round(float(c.get("size", 0) or 0), 1),
-            ),
-        ):
-            text = _join_glyphs(group)
-            if not text:
+        try:
+            return page.extract_words(
+                x_tolerance=WORD_X_TOLERANCE,
+                extra_attrs=["fontname", "size"],
+            ) or []
+        except Exception:
+            return []
+
+    @staticmethod
+    def _raw_lines(page: Any) -> list[dict]:
+        """pdfminer's own line grouping, with the characters of each line.
+
+        pdfminer knows about rotated text and text direction, so its
+        line grouping is better than anything re-derived from the
+        character boxes.
+        """
+        try:
+            return page.extract_text_lines(return_chars=True) or []
+        except Exception:
+            return []
+
+    @staticmethod
+    def _column_bands(chars: list[dict], page: Any) -> list[tuple[float, float]]:
+        """The page's column bands, left to right.
+
+        The gutter between two columns is a vertical strip of the page
+        that holds almost no text. It is found by sweeping horizontal
+        strips of the page and counting, for each x position, how many
+        of those strips hold text there — a column of x positions that
+        is empty on nearly every strip is a gutter.
+
+        The profile is built from characters, not words: a word's box
+        spans the gaps between its letters, so a word reaching into the
+        gutter hides it. Characters show the true whitespace.
+
+        A little slack is allowed because a full-width heading crosses
+        the gutter on one or two strips. Margins are excluded, a gutter
+        has to have real text on both sides, and only the widest few
+        gutters are kept.
+        """
+        if not chars:
+            return [(0.0, float(page.width))]
+
+        min_x = int(min(c["x0"] for c in chars))
+        max_x = int(max(c["x1"] for c in chars))
+        span = max_x - min_x + 2
+
+        rows: dict[int, list[dict]] = {}
+        for char in chars:
+            rows.setdefault(int(char["top"] / COLUMN_ROW_PT), []).append(char)
+        n_rows = len(rows)
+        if n_rows < 4:
+            return [(0.0, float(page.width))]
+
+        # A difference array over x: each strip that holds text in some
+        # x range adds 1 there, and a single prefix sum gives the
+        # number of strips holding text at each x.
+        diff = [0] * (span + 2)
+        for row_chars in rows.values():
+            intervals = sorted((int(c["x0"]), int(c["x1"])) for c in row_chars)
+            merged: list[tuple[int, int]] = []
+            for a, b in intervals:
+                if merged and a <= merged[-1][1] + 1:
+                    merged[-1] = (merged[-1][0], max(merged[-1][1], b))
+                else:
+                    merged.append((a, b))
+            for a, b in merged:
+                lo = max(0, a - min_x)
+                hi = min(span - 1, b - min_x)
+                if hi >= lo:
+                    diff[lo] += 1
+                    diff[hi + 1] -= 1
+
+        coverage: list[int] = []
+        running = 0
+        for value in diff:
+            running += value
+            coverage.append(running)
+
+        runs: list[tuple[int, int]] = []
+        start: Optional[int] = None
+        for offset in range(span):
+            if coverage[offset] / n_rows <= COLUMN_MAX_COVERAGE:
+                start = offset if start is None else start
+            elif start is not None:
+                runs.append((start, offset - 1))
+                start = None
+        if start is not None:
+            runs.append((start, span - 1))
+
+        min_width = page.width * COLUMN_MIN_WIDTH_FRAC
+        total = len(chars)
+        splits = []
+        for a, b in runs:
+            x_a, x_b = a + min_x, b + min_x
+            if x_a <= min_x + 2 or x_b >= max_x - 2:
+                continue  # a page margin, not a gutter
+            if (x_b - x_a) < min_width:
                 continue
+            cut = (x_a + x_b) / 2.0
+            # A gutter separates two columns, so both sides must carry
+            # real text. Without this a wide margin or a stray indented
+            # block reads as a column, and the page is then read in the
+            # wrong order.
+            left = sum(1 for c in chars if float(c["x1"]) <= cut)
+            right = sum(1 for c in chars if float(c["x0"]) >= cut)
+            if left < COLUMN_MIN_CHAR_SHARE * total or right < COLUMN_MIN_CHAR_SHARE * total:
+                continue
+            if min(left, right) < COLUMN_MIN_CHARS:
+                continue
+            splits.append((cut, b - a))
+        splits.sort(key=lambda item: -item[1])
+        cuts = sorted(x for x, _ in splits[:COLUMN_MAX_SPLITS])
+
+        edges = [0.0] + cuts + [float(page.width)]
+        return [(edges[i], edges[i + 1]) for i in range(len(edges) - 1)]
+
+    @staticmethod
+    def _word_lines(words: list[dict]) -> list[list[dict]]:
+        """Group words into lines.
+
+        Upright words are clustered by their vertical position and
+        sorted left to right within a cluster, which is pdfminer's own
+        rule for deciding what sits on the same line. Rotated words —
+        a marginal stamp, a vertical label — are clustered along their
+        own axis instead, so they do not get mixed into the horizontal
+        lines above them.
+        """
+        if not words:
+            return []
+        upright = [w for w in words if w.get("upright", True)]
+        rotated = [w for w in words if not w.get("upright", True)]
+
+        lines: list[list[dict]] = []
+        for cluster in _cluster_by_doctop(upright, LINE_Y_TOLERANCE):
+            cluster.sort(key=lambda w: float(w["x0"]))
+            lines.append(cluster)
+        if rotated:
+            for cluster in _cluster_by_position(rotated, LINE_Y_TOLERANCE, "x0"):
+                cluster.sort(key=lambda w: float(w["top"]))
+                lines.append(cluster)
+        return lines
+
+    @staticmethod
+    def _lines_from_words(words: list[dict]) -> list[PdfLine]:
+        """The lines the words make up."""
+        lines: list[PdfLine] = []
+        for cluster in PdfPlumberBackend._word_lines(words):
+            line = PdfPlumberBackend._line_from_words(cluster)
+            if line:
+                lines.append(line)
+        return lines
+
+    @staticmethod
+    def _line_from_words(words: list[dict]) -> Optional[PdfLine]:
+        """One line, built from the words that make it up.
+
+        Words are grouped into spans of one font and one size, so the
+        parser can still tell a bold run from body text.
+        """
+        if not words:
+            return None
+        groups = _group_by(
+            words,
+            lambda w: (
+                str(w.get("fontname", "") or ""),
+                round(float(w.get("size", 0) or 0), 1),
+            ),
+        )
+        spans: list[PdfSpan] = []
+        for index, group in enumerate(groups):
+            text = " ".join(str(w.get("text", "") or "") for w in group)
+            if not text.strip():
+                continue
+            # The parser joins spans without a separator, so the space
+            # between two font groups has to sit inside a span.
+            if index + 1 < len(groups):
+                text += " "
+            font = str(group[0].get("fontname", "") or "")
             spans.append(
                 PdfSpan(
                     text=text,
                     bbox=(
-                        min(float(c["x0"]) for c in group),
-                        min(float(c["top"]) for c in group),
-                        max(float(c["x1"]) for c in group),
-                        max(float(c["bottom"]) for c in group),
+                        min(float(w["x0"]) for w in group),
+                        min(float(w["top"]) for w in group),
+                        max(float(w["x1"]) for w in group),
+                        max(float(w["bottom"]) for w in group),
                     ),
                     size=float(group[0].get("size", 10.0) or 10.0),
-                    font=str(group[0].get("fontname", "") or ""),
-                    flags=_flags_for(str(group[0].get("fontname", "") or "")),
+                    font=font,
+                    flags=_flags_for(font),
                 )
             )
-        return spans
+        if not spans:
+            return None
+        return PdfLine(
+            bbox=(
+                min(s.bbox[0] for s in spans),
+                min(s.bbox[1] for s in spans),
+                max(s.bbox[2] for s in spans),
+                max(s.bbox[3] for s in spans),
+            ),
+            spans=spans,
+        )
 
     @staticmethod
     def _group_lines_into_blocks(lines: list[PdfLine]) -> list[PdfBlock]:
@@ -593,27 +818,39 @@ class PdfPlumberBackend:
         )
 
 
-def _join_glyphs(chars: list[dict]) -> str:
-    """Reassemble glyphs into text, restoring the spaces between them.
+def _split_at_gutters(line: list[dict],
+                      bands: list[tuple[float, float]]) -> list[list[dict]]:
+    """Split a line where the whitespace is a column gutter.
 
-    The threshold is relative to the glyph width, because a space in
-    an 8pt font is narrower than one in a 20pt font, and a fixed
-    threshold either loses spaces in small text or invents them in
-    large text.
+    A line on a two-column page holds both columns, because pdfminer
+    groups characters by baseline. The two columns are separated by the
+    gutter, and the gutter is much wider than the space between two
+    words — measured on the corpus, seven times wider.
+
+    A line that is one full-width paragraph has ordinary word spacing
+    all the way along, and cutting it at the column position would
+    tear the paragraph in half. Splitting only where the gap is a real
+    gutter tells the two cases apart.
+
+    The split also only happens at a column boundary: a wide gap
+    somewhere else on the page — a diagram drawn with individually
+    placed letters, say — is not a column and must not be broken up.
     """
-    if not chars:
-        return ""
-    parts: list[str] = []
-    previous: Optional[dict] = None
-    for char in chars:
-        if previous is not None:
-            gap = float(char.get("x0", 0) or 0) - float(previous.get("x1", 0) or 0)
-            width = float(previous.get("width", 0) or 0)
-            if gap > max(0.35, width * 0.22):
-                parts.append(" ")
-        parts.append(str(char.get("text", "")))
-        previous = char
-    return "".join(parts)
+    if len(line) < 3:
+        return [line]
+    cuts = [b[0] for b in bands[1:]]
+    if not cuts:
+        return [line]
+
+    segments: list[list[dict]] = [[line[0]]]
+    for previous, word in zip(line, line[1:]):
+        gap = float(word["x0"]) - float(previous["x1"])
+        at_boundary = any(previous["x1"] <= cut <= word["x0"] for cut in cuts)
+        if at_boundary and gap > GUTTER_MIN_GAP_PT:
+            segments.append([word])
+        else:
+            segments[-1].append(word)
+    return segments
 
 
 def _group_by(items: list[dict], key) -> list[list[dict]]:
@@ -627,6 +864,49 @@ def _group_by(items: list[dict], key) -> list[list[dict]]:
             current_key = item_key
         groups[-1].append(item)
     return groups
+
+
+def _cluster_by_doctop(items: list[dict], tolerance: float) -> list[list[dict]]:
+    """Group items that sit on the same line, the way pdfminer does.
+
+    The vertical positions are clustered with a tolerance, and items
+    within a cluster belong to the same line. This is pdfminer's own
+    rule, reimplemented so the backend does not depend on a private
+    pdfminer API.
+    """
+    return _cluster_by_position(items, tolerance, "doctop")
+
+
+def _cluster_by_position(items: list[dict], tolerance: float,
+                         key: str) -> list[list[dict]]:
+    """Cluster items by one coordinate, within a tolerance."""
+    if not items:
+        return []
+
+    def position(item: dict) -> float:
+        value = item.get(key)
+        if value is None:
+            value = item.get("top", 0)
+        return float(value or 0)
+
+    values = sorted({position(item) for item in items})
+    clusters: list[list[float]] = [[values[0]]]
+    last = values[0]
+    for value in values[1:]:
+        if value <= last + tolerance:
+            clusters[-1].append(value)
+        else:
+            clusters.append([value])
+        last = value
+    assignment: dict[float, int] = {}
+    for index, cluster in enumerate(clusters):
+        for value in cluster:
+            assignment[value] = index
+
+    groups: dict[int, list[dict]] = {}
+    for item in items:
+        groups.setdefault(assignment[position(item)], []).append(item)
+    return [groups[index] for index in sorted(groups)]
 
 
 def _flags_for(font_name: str) -> int:
@@ -685,3 +965,4 @@ def get_backend(name: Optional[str] = None) -> PdfBackend:
             f"unknown PDF backend {name!r}; available: {', '.join(available_backends())}"
         )
     return _BACKENDS[key]()
+
