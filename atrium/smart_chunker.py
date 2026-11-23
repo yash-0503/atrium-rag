@@ -280,7 +280,7 @@ def _validate_chunk_parameters(cfg) -> None:
 # Choice rationale:
 #   - `balanced`  → baseline (Strategy A) at the legacy 1000/150
 #                  defaults. Fastest, smallest memory. The hot path.
-#   - `precise`   → structure_aware (Strategy D) at 700/100. The
+#   - `precise`   → structure_aware (Strategy D) at 1200/100. The
 #                  structure_aware strategy is what the old chunk_elements
 #                  already does, just with tighter packing for dense
 #                  technical docs. Smallest change from baseline.
@@ -288,6 +288,21 @@ def _validate_chunk_parameters(cfg) -> None:
 #                  chars, children at 1000. Most expensive (2x chunks)
 #                  but produces context for citation. Opt-in for users
 #                  who need surrounding context in their results.
+#
+# `precise` was 700/100 until 2026-11-23. It was measured, on the 19-doc
+# dev split against the same parsed content, at 700/100 vs 1200/100:
+# R@5 0.715 -> 0.815, nDCG@10 0.637 -> 0.706, and 34% FEWER chunks
+# (2,407 -> 1,592). The reason is that a long answer — the p90 gold
+# evidence span is 158 tokens, roughly 700-1000 characters — does not
+# fit inside a 700-character chunk, so it gets split across two and
+# neither half covers enough of it to be recognised as the answer.
+# Splitting the answer is worse than carrying a little more context.
+#
+# A size sweep put the optimum at ~1200: 1000 recovers only half the
+# win (R@5 0.770) and 1600 is no better than 1200 (0.810).
+#
+# NOTE: the published 19-fixture benchmark was measured at 700/100, so
+# every number quoted against it needs re-baselining.
 PRESETS: dict = {
     "balanced": ChunkConfig(
         target_chars=1000, overlap_chars=150,
@@ -295,7 +310,7 @@ PRESETS: dict = {
         mode="balanced",
     ),
     "precise": ChunkConfig(
-        target_chars=700, overlap_chars=100,
+        target_chars=1200, overlap_chars=100,
         strategy=STRATEGY_STRUCTURE_AWARE,
         mode="precise",
     ),
@@ -310,7 +325,7 @@ PRESETS: dict = {
 # The production default, pinned. `chunk_default` and `DEFAULT_CHUNK_CONFIG`
 # are the documented back-compat surface for call sites that
 # predate the mode dispatcher. It is bound to PRESETS["precise"] — the
-# structure-aware strategy at 700/100 chars, which is what the 19-fixture
+# structure-aware strategy at 1200/100 chars, which is what the 19-fixture
 # benchmark measures.
 DEFAULT_CHUNK_CONFIG: ChunkConfig = PRESETS["precise"]
 
@@ -1275,7 +1290,7 @@ def chunk_with_mode(elements, doc_id: str, file_name: str,
 
 def chunk_default(elements, doc_id: str, file_name: str) -> list:
     """Back-compat entry point bound to `DEFAULT_CHUNK_CONFIG`
-    (PRESETS["precise"] — structure_aware at 700/100 chars).
+    (PRESETS["precise"] — structure_aware at 1200/100 chars).
 
     Kept for call sites that predate the mode dispatcher. The signature
     matches `chunk_elements` so it's a drop-in replacement. New code
