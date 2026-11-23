@@ -3,7 +3,7 @@ test_chunking_default.py
 
 Regression tests for the production chunker wiring (`chunk_default` in
 `atrium/smart_chunker.py`). The chunker is bound to `PRESETS["precise"]`
-— the structure-aware strategy at 700/100 chars — which is the config the
+— the structure-aware strategy at 1200/100 chars — which is the config the
 19-fixture benchmark measures.
 
 These tests lock the SHIPPED behavior of `chunk_default` (the wrapper the

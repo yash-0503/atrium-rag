@@ -41,10 +41,57 @@ CREATE TABLE IF NOT EXISTS chunks (
     text          TEXT,
     dim           INTEGER,
     vector        BLOB,
-    payload       TEXT
+    payload       TEXT,
+    element_type  TEXT,
+    is_parent     INTEGER DEFAULT 0,
+    page_number   INTEGER,
+    section_path  TEXT
 );
 CREATE INDEX IF NOT EXISTS idx_chunks_doc ON chunks(doc_id);
 """
+
+# How many times a write retries when SQLite reports the database is
+# locked. Six attempts with a doubling delay covers about 3 seconds.
+WRITE_RETRIES = 6
+
+# Columns added after the first release. `CREATE TABLE IF NOT EXISTS`
+# does not add a column to a table that already exists, so an existing
+# database keeps its old shape and a query that reads the new columns
+# fails against it. Each one is added here, once, if it is missing.
+_MIGRATED_COLUMNS = (
+    ("element_type", "TEXT"),
+    ("is_parent", "INTEGER DEFAULT 0"),
+    ("page_number", "INTEGER"),
+    ("section_path", "TEXT"),
+)
+
+
+def _safe_json(raw: Optional[str]) -> dict:
+    """Parse a stored payload, tolerating a corrupt one.
+
+    One unreadable row used to abort the whole search, which hid the
+    entire corpus behind a single bad row. A row that cannot be parsed
+    yields an empty payload: the chunk is still returned, it just
+    carries no extra fields.
+    """
+    if not raw:
+        return {}
+    try:
+        value = json.loads(raw)
+    except (ValueError, TypeError):
+        return {}
+    return value if isinstance(value, dict) else {}
+
+
+def _decode_section_path(raw: Optional[str]) -> list:
+    """The stored section path, as a list of strings."""
+    if not raw:
+        return []
+    try:
+        value = json.loads(raw)
+    except (ValueError, TypeError):
+        return []
+    return list(value) if isinstance(value, list) else []
 
 
 class SqliteAdapter:
@@ -89,12 +136,51 @@ class SqliteAdapter:
             db_path = Path(self.path).expanduser()
             if db_path.parent and str(db_path.parent) not in ("", "."):
                 db_path.parent.mkdir(parents=True, exist_ok=True)
-            conn = sqlite3.connect(str(db_path), check_same_thread=False)
+            # busy_timeout: how long a blocked write waits for the lock
+            # before giving up. The stdlib default is 5 s, which is
+            # short enough that two overlapping ingests fail outright.
+            conn = sqlite3.connect(
+                str(db_path), check_same_thread=False, timeout=30.0,
+            )
             conn.row_factory = sqlite3.Row
+            # WAL: readers do not block the writer and the writer does
+            # not block readers. The rollback journal made a reader wait
+            # out the writer's EXCLUSIVE window at commit — measured at
+            # 2.2 s for an 8,000-row write against a 35 ms median.
+            # `job_store.py` has used WAL all along; the vector store
+            # did not.
+            try:
+                conn.execute("PRAGMA journal_mode=WAL")
+                conn.execute("PRAGMA synchronous=NORMAL")
+            except sqlite3.Error:
+                pass  # an in-memory or exotic filesystem may refuse these
             conn.executescript(_SCHEMA)
+            self._migrate(conn)
             conn.commit()
             self._conn = conn
         return self._conn
+
+    @staticmethod
+    def _migrate(conn: sqlite3.Connection) -> None:
+        """Add any column a newer build expects but an older file lacks.
+
+        `CREATE TABLE IF NOT EXISTS` leaves an existing table exactly as
+        it was created, so a database file written before a column was
+        added would fail every query that reads it. The alternative —
+        a version stamp and a rebuild — is a much bigger change than the
+        four columns are worth.
+        """
+        try:
+            have = {row["name"] for row in conn.execute("PRAGMA table_info(chunks)")}
+        except sqlite3.Error:
+            return
+        for name, decl in _MIGRATED_COLUMNS:
+            if name in have:
+                continue
+            try:
+                conn.execute(f"ALTER TABLE chunks ADD COLUMN {name} {decl}")
+            except sqlite3.Error:
+                pass
 
     def close(self) -> None:
         if self._conn is not None:
@@ -140,17 +226,22 @@ class SqliteAdapter:
         produce — the same convention the other adapters use.
         """
         conn = self._connect()
+        # The whole table, not an arbitrary sample of 200 rows. The
+        # sample was unordered, so a v1 corpus whose first 200 rows
+        # happened to be v0 reported version 0 — and the retrieval
+        # layer then took the flat v0 branch and never used the
+        # parent-child path at all. A whole-table scan of a small
+        # integer column is cheap.
         row = conn.execute(
-            "SELECT payload FROM chunks LIMIT 200"
-        ).fetchall()
-        version = 0
-        for item in row:
-            try:
-                payload = json.loads(item["payload"] or "{}")
-            except (TypeError, ValueError):
-                continue
-            version = max(version, int(payload.get("schema_version", 0) or 0))
-        return version
+            "SELECT MAX(CAST(json_extract(payload, '$.schema_version') AS INTEGER))"
+            " AS v FROM chunks"
+        ).fetchone()
+        if row is None or row["v"] is None:
+            return 0
+        try:
+            return int(row["v"])
+        except (TypeError, ValueError):
+            return 0
 
     # -- writing --------------------------------------------------------
 
@@ -184,27 +275,61 @@ class SqliteAdapter:
             vector = list(getattr(chunk, "embedding", None) or [])
             if not vector:
                 continue
-            payload = chunk.model_dump(exclude={"embedding"})
-            rows.append((
-                chunk.chunk_id,
-                chunk.doc_id,
-                getattr(chunk, "ingest_run_id", "") or "",
-                chunk.text,
-                len(vector),
-                struct.pack(f"{len(vector)}f", *vector),
-                json.dumps(payload, ensure_ascii=False, default=str),
-            ))
+            self._check_dim(len(vector))
+            rows.append(self._row(chunk, vector, struct))
         if not rows:
             return
-        with self._lock:
+
+        def _do():
             conn.executemany(
                 "INSERT OR REPLACE INTO chunks"
-                "(chunk_id, doc_id, ingest_run_id, text, dim, vector, payload)"
-                " VALUES (?, ?, ?, ?, ?, ?, ?)",
+                "(chunk_id, doc_id, ingest_run_id, text, dim, vector, payload,"
+                " element_type, is_parent, page_number, section_path)"
+                " VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
                 rows,
             )
             self._bump_corpus_version(conn)
             conn.commit()
+
+        self._write_locked(_do)
+
+    @staticmethod
+    def _row(chunk: Any, vector: list, struct) -> tuple:
+        """One row for the `chunks` table.
+
+        The stored payload deliberately drops `text` and `embed_text`:
+
+        - `text` is already in its own column, so keeping a copy in the
+          payload stored every chunk's text twice.
+        - `embed_text` is a third copy of the text (plus a heading
+          breadcrumb) and is only ever needed at embed time. No read
+          path reads it back — it is derivable from the text and the
+          section path.
+
+        Together those two copies were 20% of the database file.
+
+        The fields a search needs — the element type, whether the chunk
+        is a parent, the page number and the section path — are written
+        as real columns as well, so the search path never has to parse
+        the payload JSON. That was 95% of the query time.
+        """
+        payload = chunk.model_dump(exclude={"embedding", "text", "embed_text"})
+        source = payload.get("source") or {}
+        page_number = source.get("page_number")
+        section_path = source.get("section_path") or []
+        return (
+            chunk.chunk_id,
+            chunk.doc_id,
+            getattr(chunk, "ingest_run_id", "") or "",
+            chunk.text,
+            len(vector),
+            struct.pack(f"{len(vector)}f", *vector),
+            json.dumps(payload, ensure_ascii=False, default=str),
+            payload.get("element_type") or "",
+            1 if payload.get("is_parent") else 0,
+            page_number,
+            json.dumps(list(section_path), ensure_ascii=False),
+        )
 
     def delete_stale_chunks(self, doc_id: str, current_run_id: str) -> None:
         """Drop this document's chunks that are not from the current run."""
@@ -240,18 +365,10 @@ class SqliteAdapter:
             vector = list(getattr(chunk, "embedding", None) or [])
             if not vector:
                 continue
-            payload = chunk.model_dump(exclude={"embedding"})
-            rows.append((
-                chunk.chunk_id,
-                chunk.doc_id,
-                getattr(chunk, "ingest_run_id", "") or "",
-                chunk.text,
-                len(vector),
-                struct.pack(f"{len(vector)}f", *vector),
-                json.dumps(payload, ensure_ascii=False, default=str),
-            ))
+            self._check_dim(len(vector))
+            rows.append(self._row(chunk, vector, struct))
 
-        with self._lock:
+        def _do():
             conn.execute("BEGIN IMMEDIATE")
             self._corpus_cache = None
             try:
@@ -262,8 +379,9 @@ class SqliteAdapter:
                 if rows:
                     conn.executemany(
                         "INSERT OR REPLACE INTO chunks"
-                        "(chunk_id, doc_id, ingest_run_id, text, dim, vector, payload)"
-                        " VALUES (?, ?, ?, ?, ?, ?, ?)",
+                        "(chunk_id, doc_id, ingest_run_id, text, dim, vector, payload,"
+                        " element_type, is_parent, page_number, section_path)"
+                        " VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
                         rows,
                     )
                 self._bump_corpus_version(conn)
@@ -271,6 +389,8 @@ class SqliteAdapter:
             except Exception:
                 conn.execute("ROLLBACK")
                 raise
+
+        self._write_locked(_do)
 
     # -- reading --------------------------------------------------------
 
@@ -318,21 +438,91 @@ class SqliteAdapter:
         import numpy as np
 
         conn = self._connect()
+        # The payload is NOT selected here. It is the largest field in
+        # the row, and nothing in the search path needs it: the fields a
+        # hit reports are all real columns now. Selecting it made
+        # `json.loads` on every row 95% of the query time.
         rows = conn.execute(
-            "SELECT chunk_id, doc_id, text, dim, vector, payload FROM chunks"
+            "SELECT chunk_id, doc_id, text, dim, vector, payload, element_type,"
+            " is_parent, page_number, section_path FROM chunks"
         ).fetchall()
         if not rows:
             self._corpus_cache = ([], np.zeros((0, 0), dtype=np.float32))
             self._corpus_cache_version = version
             return self._corpus_cache
 
-        dim = int(rows[0]["dim"] or 0)
-        usable = [row for row in rows if int(row["dim"] or 0) == dim]
+        # The reference dimension comes from the collection's `meta.dim`,
+        # not from whichever row SQLite happened to return first. The
+        # unordered `SELECT` made it arbitrary, and a row of another
+        # width was then silently dropped from the corpus — invisible to
+        # every query, but still counted by `count_chunks`.
+        dim = self._collection_dim()
+        usable = [row for row in rows if dim is None or int(row["dim"] or 0) == dim]
+        if not usable:
+            usable = rows
+            dim = int(usable[0]["dim"] or 0)
         buffer = b"".join(row["vector"] for row in usable)
         matrix = np.frombuffer(buffer, dtype=np.float32).reshape(len(usable), dim)
         self._corpus_cache = (usable, matrix)
         self._corpus_cache_version = version
         return self._corpus_cache
+
+    def _write_locked(self, work):
+        """Run a write under the lock, retrying if the database is locked.
+
+        Two processes writing the same file — the API and the worker —
+        can collide on SQLite's write lock. The busy timeout absorbs a
+        short collision, but a long one (a bulk ingest holding the lock
+        for seconds) used to surface as `database is locked` and fail
+        the ingest outright, with no retry anywhere. SQLite's answer to
+        a busy database is to try again.
+        """
+        import time
+
+        delay = 0.05
+        last: Optional[BaseException] = None
+        for _attempt in range(WRITE_RETRIES):
+            try:
+                with self._lock:
+                    return work()
+            except sqlite3.OperationalError as exc:
+                if "locked" not in str(exc).lower() and "busy" not in str(exc).lower():
+                    raise
+                last = exc
+                time.sleep(delay)
+                delay = min(delay * 2, 1.0)
+        if last is not None:
+            raise last
+
+    def _check_dim(self, width: int) -> None:
+        """Refuse a vector whose width is not the collection's.
+
+        A wrong-width vector used to be stored happily and then silently
+        dropped when the corpus was loaded, so the chunk was invisible to
+        every query while still being counted by `count_chunks`. Catching
+        it at the write turns that into an error at the point where it
+        can still be understood.
+        """
+        expected = self._collection_dim()
+        if expected is not None and int(width) != expected:
+            raise ValueError(
+                f"chunk vector has dimension {width}, but the collection "
+                f"is {expected}-dimensional. The embedding model or "
+                f"EMBED_DIM does not match the corpus."
+            )
+
+    def _collection_dim(self) -> Optional[int]:
+        """The dimension the collection was created with, from `meta`."""
+        conn = self._connect()
+        row = conn.execute(
+            "SELECT value FROM meta WHERE key = 'dim'"
+        ).fetchone()
+        if row is None or not row["value"]:
+            return None
+        try:
+            return int(row["value"])
+        except (TypeError, ValueError):
+            return None
 
     def count_chunks(self) -> int:
         """How many chunks the store holds."""
@@ -361,7 +551,16 @@ class SqliteAdapter:
         if query.ndim != 1 or query.size == 0:
             return []
         if matrix.shape[1] != query.size:
-            return []
+            # A dimension mismatch used to return an empty list, which
+            # through /search is indistinguishable from an empty corpus
+            # — a 200 with no results and no explanation. It means the
+            # query vector and the stored corpus disagree (usually the
+            # embedding model changed), and it has to say so.
+            raise ValueError(
+                f"query vector has dimension {query.size}, but the store "
+                f"holds {matrix.shape[1]}-dimensional vectors. The "
+                f"embedding model or EMBED_DIM does not match the corpus."
+            )
 
         # The vectors are stored as raw float32, so the whole corpus is
         # one matrix and the cosine is one matrix product. Doing this
@@ -373,31 +572,53 @@ class SqliteAdapter:
         query_norm = float(np.linalg.norm(query)) or 1.0
         scores = (matrix @ query).ravel() / (norms.ravel() * query_norm)
 
+        # Score everything (one matrix product), then build hit dicts
+        # only for the rows that can still make the cut. Building a dict
+        # for every row and sorting afterwards cost more than the vector
+        # math at every corpus size measured.
+        limit = max(int(top_k), 0)
+        if limit == 0:
+            return []
+        order = np.argsort(-scores)
         scored: List[Dict[str, Any]] = []
-        for position, row in enumerate(rows):
-            payload = json.loads(row["payload"] or "{}")
-            if children_only and bool(payload.get("is_parent", False)):
+        for position in order:
+            index = int(position)
+            row = rows[index]
+            if children_only and row["is_parent"]:
                 continue
-            score = float(scores[position])
+            score = float(scores[index])
             if score_threshold is not None and score < float(score_threshold):
                 continue
-            page_number, section_path = source_fields(payload)
+            # The payload is parsed only for the rows that make the
+            # cut. It carries the two fields that are not worth a
+            # column — the parent link and the strategy name — and it
+            # is the fallback for a row written before those columns
+            # existed, whose column values are NULL.
+            payload = _safe_json(row["payload"])
+            payload_page, payload_section = source_fields(payload)
+            page_number = row["page_number"]
+            if page_number is None:
+                page_number = payload_page
+            section_path = _decode_section_path(row["section_path"])
+            if not section_path:
+                section_path = payload_section
+            element_type = row["element_type"] or payload.get("element_type", "")
             scored.append({
                 "id": row["chunk_id"],
-                "score": float(score),
+                "score": score,
                 "text": row["text"] or "",
                 "doc_id": row["doc_id"] or "",
                 "chunk_id": payload.get("chunk_id", row["chunk_id"]),
                 "page_number": page_number,
                 "section_path": section_path,
-                "element_type": payload.get("element_type", ""),
-                "is_parent": bool(payload.get("is_parent", False)),
+                "element_type": element_type,
+                "is_parent": bool(row["is_parent"]),
                 "parent_id": payload.get("parent_id"),
                 "chunking_strategy": payload.get("chunking_strategy", ""),
             })
-
-        scored.sort(key=lambda hit: hit["score"], reverse=True)
-        return scored[: max(int(top_k), 0)]
+            if len(scored) >= limit:
+                break
+        return scored
 
     def retrieve_parents(
         self, parent_ids: List[str]
@@ -413,7 +634,7 @@ class SqliteAdapter:
         ).fetchall()
         parents: Dict[str, Dict[str, Any]] = {}
         for row in rows:
-            payload = json.loads(row["payload"] or "{}")
+            payload = _safe_json(row["payload"])
             page_number, section_path = source_fields(payload)
             parents[row["chunk_id"]] = {
                 "id": row["chunk_id"],
