@@ -167,6 +167,7 @@ def retrieve_and_rerank(
     candidate_multiplier: Optional[int] = None,
     bm25_index: Optional[Any] = None,
     bm25_candidate_k: Optional[int] = None,
+    stats: Optional[Dict[str, Any]] = None,
 ) -> List[Dict[str, Any]]:
     """Unified retrieval + rerank + parent-child resolution.
 
@@ -192,6 +193,11 @@ def retrieve_and_rerank(
         candidate_multiplier: over-fetch factor for parent dedup when
             no reranker is supplied. Defaults to `DEDUP_FACTOR=3`.
             Cap is `MAX_CANDIDATE_FACTOR=5`.
+        stats: an optional dict the caller can pass in. It is filled
+            with what actually happened, so the API can report the
+            truth: `stats["reranked"]` is True only if the
+            cross-encoder really scored these results. A reranker that
+            was built but then failed leaves it False.
         bm25_index: optional `atrium.bm25.BM25Index` instance. When
             supplied, the function consults BM25 only when the
             confidence-gate heuristic decides dense retrieval is
@@ -310,9 +316,17 @@ def retrieve_and_rerank(
     # Step 2 — optional rerank. Cross-encoders score child text (not
     # parent) — they're optimized for short passages. The reranker
     # returns up to top_k RerankCandidate entries with new scores.
-    hits = _apply_rerank(
-        query_text, raw_candidates, top_k, reranker,
-    ) if reranker is not None else raw_candidates
+    #
+    # `reranked` records whether the cross-encoder actually scored the
+    # results. A reranker that failed falls back to vector order, and
+    # the caller needs to be able to say so rather than report that
+    # reranking happened.
+    if reranker is not None:
+        hits, reranked = _apply_rerank(
+            query_text, raw_candidates, top_k, reranker,
+        )
+    else:
+        hits, reranked = raw_candidates, False
 
     # Step 3 — dedup by parent_id (v1 only).
     if is_v1:
@@ -325,6 +339,23 @@ def retrieve_and_rerank(
     # Step 4 — parent resolution (v1 only). Batched single call.
     if is_v1:
         hits = _resolve_parents(db, hits)
+
+    # Step 5 — the caller asked for top_k results.
+    #
+    # The truncation is HERE, at the end, and not in the rerank
+    # fallback: the candidate set is deliberately wider than top_k so
+    # that the cross-encoder has something to choose from and so that
+    # the parent dedup has the breadth to survive collapsing many
+    # children into one parent. Cutting it earlier would throw that
+    # away. The v1 path was already truncated by the dedup; the v0
+    # path was not, which is how a request for 3 results could come
+    # back with 30.
+    hits = hits[: max(int(top_k), 0)]
+
+    if stats is not None:
+        stats["reranked"] = reranked
+        stats["candidate_count"] = len(raw_candidates)
+        stats["returned_count"] = len(hits)
 
     return hits
 
@@ -474,7 +505,13 @@ def _hybrid_fuse(
 def _apply_rerank(query_text, candidates, top_k, reranker):
     """Optional cross-encoder rerank. On success returns the reranked
     list (preserving original child payload via id lookup); on failure
-    returns the input list sorted by vector score."""
+    returns the input list sorted by vector score.
+
+    Returns `(hits, reranked)` — the second value says whether the
+    cross-encoder actually scored these results. The caller reports it
+    to the API, so a reranker that failed must not be reported as
+    though it worked.
+    """
     # Lazy import: rerank_adapter is heavy (it pulls sentence-transformers
     # for the local model); the /search path without rerank shouldn't
     # pay that import cost.
@@ -495,10 +532,17 @@ def _apply_rerank(query_text, candidates, top_k, reranker):
         reranked = None
 
     if reranked is None:
-        # Rerank failed (or no reranker input) — fall back to vector order.
+        # Rerank failed (or no reranker input) — fall back to vector
+        # order.
+        #
+        # The whole candidate set is returned, NOT a slice of top_k.
+        # The candidate set is deliberately wider than top_k: the
+        # cross-encoder picks from it, and the parent dedup needs the
+        # extra breadth to survive collapsing many children into one
+        # parent. The caller truncates the final list to top_k.
         out = list(candidates)
         out.sort(key=lambda h: h.get("score", 0.0), reverse=True)
-        return out
+        return out, False
 
     # Map reranked ids back to original children for parent_id and
     # other fields the cross-encoder doesn't see.
@@ -520,7 +564,7 @@ def _apply_rerank(query_text, candidates, top_k, reranker):
             "chunking_strategy": orig.get("chunking_strategy", ""),
         })
     out.sort(key=lambda h: h.get("score", 0.0), reverse=True)
-    return out
+    return out, True
 
 
 def _dedup_by_parent(hits, top_k):

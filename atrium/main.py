@@ -574,6 +574,11 @@ async def search(body: SearchRequest):
         log.warning("search embed failed: %s", exc)
         raise HTTPException(503, f"Embedder unavailable: {_explain(exc)}") from exc
 
+    # The stats dict is how the response learns what actually happened.
+    # A reranker that was configured but then failed leaves
+    # `reranked` False, and the response says so rather than claiming
+    # the results were reranked.
+    stats: dict = {}
     try:
         hits = await asyncio.to_thread(
             retrieve_and_rerank,
@@ -584,10 +589,18 @@ async def search(body: SearchRequest):
             reranker=reranker,
             candidate_k=body.candidate_k,
             score_threshold=body.score_threshold,
+            stats=stats,
         )
     except Exception as exc:
         log.warning("search retrieval failed: %s", exc)
         raise HTTPException(503, f"Retrieval failed: {exc}") from exc
+
+    reranked = bool(stats.get("reranked", False))
+    if reranker is not None and not reranked:
+        log.warning(
+            "reranker was configured but the rerank did not run; "
+            "serving the vector ranking for this query",
+        )
 
     results = []
     for rank, hit in enumerate(hits, start=1):
@@ -619,7 +632,12 @@ async def search(body: SearchRequest):
     return {
         "query": query,
         "top_k": top_k,
-        "rerank": reranker is not None,
+        # Whether these results were actually reranked — not whether a
+        # reranker happened to be configured.
+        "rerank": reranked,
+        # Whether a reranker was available at all, which is a different
+        # fact from whether it ran.
+        "rerank_available": reranker is not None,
         "count": len(results),
         "corpus_chunks": corpus_chunks,
         "took_ms": int((time.monotonic() - started) * 1000),
