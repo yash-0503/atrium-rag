@@ -607,6 +607,11 @@ async def search(body: SearchRequest):
         results.append({
             "rank": rank,
             "score": float(hit.get("score", 0.0)),
+            # What the score means: a cosine similarity, an RRF score,
+            # or a cross-encoder score. The scales differ by 25x, so a
+            # caller that does not know which one it is reading cannot
+            # interpret the number.
+            "score_type": hit.get("score_type", "cosine"),
             "chunk_id": hit.get("chunk_id"),
             "doc_id": hit.get("doc_id", ""),
             "text": hit.get("text", ""),
@@ -635,6 +640,9 @@ async def search(body: SearchRequest):
         # Whether these results were actually reranked — not whether a
         # reranker happened to be configured.
         "rerank": reranked,
+        # The score type of every result, so the caller does not have
+        # to read it off the first hit.
+        "score_type": (results[0].get("score_type") if results else "cosine"),
         # Whether a reranker was available at all, which is a different
         # fact from whether it ran.
         "rerank_available": reranker is not None,
@@ -1507,6 +1515,7 @@ async def retrieval_lab_search(
             results.append({
                 "rank": rank,
                 "score": float(sims[i]),
+                "score_type": "cosine",
                 "chunk_id": c["chunk_id"],
                 "text": c["text"],
                 "page_number": c["page_number"],
@@ -1517,6 +1526,7 @@ async def retrieval_lab_search(
             "query": query,
             "top_k": top_k,
             "hybrid": False,
+            "score_type": "cosine",
             "results": results,
         }
 
@@ -1529,15 +1539,24 @@ async def retrieval_lab_search(
     # BM25 ranks for the same query.
     sparse_hits = sess.bm25_index.search_with_meta(query, top_k=cand_k) or []
 
-    RRF_K = 60  # Cormack et al. 2009 — same constant as atrium/retrieval.py
+    # The fusion itself comes from the shared implementation, so the lab
+    # and the product rank the same way. When there were two copies of
+    # this algorithm, the lab measured a different system than the one
+    # the product ran.
+    from atrium.retrieval import rrf_fuse
+
+    dense_ids = [kept_chunks[int(idx)]["chunk_id"] for idx in dense_ranks]
+    sparse_ids = [str(cid) for cid, _score, _meta in sparse_hits]
+    rrf = rrf_fuse(dense_ids, sparse_ids)
+
     fused: dict[str, dict[str, Any]] = {}
 
-    # Dense contribution. Each dense hit gets 1/(RRF_K + dense_rank).
-    for dense_rank, idx in enumerate(dense_ranks, start=1):
+    # Dense contribution. The score comes from the shared fusion.
+    for idx in dense_ranks:
         i = int(idx)
         c = kept_chunks[i]
         cid = c["chunk_id"]
-        rrf_contrib = 1.0 / (RRF_K + dense_rank)
+        slot = rrf[cid]
         cur = fused.get(cid)
         if cur is None:
             fused[cid] = {
@@ -1546,22 +1565,22 @@ async def retrieval_lab_search(
                 "page_number": c["page_number"],
                 "section_path": c["section_path"],
                 "element_type": c["element_type"],
-                "rrf_score": rrf_contrib,
-                "rrf_rank_dense": dense_rank,
+                "rrf_score": slot["score"],
+                "rrf_rank_dense": slot["rank_dense"],
                 "rrf_rank_sparse": None,
                 "dense_score": float(sims[i]),
             }
         else:
-            cur["rrf_score"] += rrf_contrib
-            cur["rrf_rank_dense"] = dense_rank
+            cur["rrf_score"] = slot["score"]
+            cur["rrf_rank_dense"] = slot["rank_dense"]
             cur["dense_score"] = float(sims[i])
 
     # Sparse (BM25) contribution. Each BM25 hit gets 1/(RRF_K + sparse_rank).
     # Hits present only here are promoted to a full hit shape using the
     # metadata we stored at prepare time (text, page_number, etc.) — no
     # second round-trip needed.
-    for sparse_rank, (cid, _bm25_score, bm25_meta) in enumerate(sparse_hits, start=1):
-        rrf_contrib = 1.0 / (RRF_K + sparse_rank)
+    for cid, _bm25_score, bm25_meta in sparse_hits:
+        slot = rrf[str(cid)]
         cur = fused.get(cid)
         if cur is None:
             # BM25-only hit. Use the chunk's text/page if we have the
@@ -1587,14 +1606,14 @@ async def retrieval_lab_search(
                 "page_number": page_number,
                 "section_path": section_path,
                 "element_type": element_type,
-                "rrf_score": rrf_contrib,
-                "rrf_rank_dense": None,
-                "rrf_rank_sparse": sparse_rank,
+                "rrf_score": slot["score"],
+                "rrf_rank_dense": slot["rank_dense"],
+                "rrf_rank_sparse": slot["rank_sparse"],
                 "dense_score": None,
             }
         else:
-            cur["rrf_score"] += rrf_contrib
-            cur["rrf_rank_sparse"] = sparse_rank
+            cur["rrf_score"] = slot["score"]
+            cur["rrf_rank_sparse"] = slot["rank_sparse"]
 
     # Sort by fused RRF score desc, truncate to top_k. The score
     # surfaced in the response is the RRF score (a small positive
@@ -1609,6 +1628,7 @@ async def retrieval_lab_search(
         results.append({
             "rank": rank,
             "score": float(h["rrf_score"]),
+            "score_type": "rrf",
             "chunk_id": h["chunk_id"],
             "text": h["text"],
             "page_number": h["page_number"],
@@ -1622,6 +1642,7 @@ async def retrieval_lab_search(
         "query": query,
         "top_k": top_k,
         "hybrid": True,
+        "score_type": "rrf",
         "results": results,
     }
 

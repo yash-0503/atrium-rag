@@ -38,7 +38,7 @@ ingested before the field existed.
 from __future__ import annotations
 
 import logging
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Sequence
 
 from atrium.config import env_float
 
@@ -61,6 +61,17 @@ MAX_CANDIDATE_FACTOR = 5
 # trap: the dense-vs-hybrid comparison isolates the ranker change
 # from any fusion-tuning noise.
 RRF_K = 60
+
+# What the number in a hit's `score` field means.
+#
+# The stores return a cosine similarity (-1..1). The fusion replaces it
+# with an RRF score (~0.016..0.033), and the cross-encoder replaces it
+# again with its own scale. A caller that reads `score` without knowing
+# which stage produced it is reading a number whose meaning it does not
+# know, and the scales differ by 25x.
+SCORE_TYPE_COSINE = "cosine"
+SCORE_TYPE_RRF = "rrf"
+SCORE_TYPE_RERANK = "rerank"
 
 # Confidence-gate thresholds (2026-10-18). The gate decides when
 # retrieve_and_rerank consults BM25 on top of the dense result.
@@ -257,6 +268,13 @@ def retrieve_and_rerank(
     if not raw_candidates and bm25_index is None:
         return []
 
+    # What the number in `score` means. The stores return a cosine
+    # similarity; the fusion replaces it with an RRF score, and the
+    # cross-encoder replaces it again. A 25x change of scale with
+    # nothing saying which is what the caller has to guess at.
+    for hit in raw_candidates:
+        hit.setdefault("score_type", SCORE_TYPE_COSINE)
+
     # Step 1b — optional hybrid fusion with BM25 (2026-10-11
     # experiment). When bm25_index is supplied, do a BM25 search
     # over the same corpus, look up the original dense candidates
@@ -300,6 +318,7 @@ def retrieve_and_rerank(
                 raw_candidates = _hybrid_fuse(
                     raw_candidates, bm25_index, query_text, top_k=cand_k,
                     sparse_top_k=bm25_top,
+                    score_threshold=score_threshold,
                 )
             except Exception as exc:
                 # Graceful fallback: BM25 raised (tokenization error,
@@ -360,12 +379,61 @@ def retrieve_and_rerank(
     return hits
 
 
+def rrf_fuse(
+    dense_ranked: Sequence[str],
+    sparse_ranked: Sequence[str],
+    k: int = RRF_K,
+) -> Dict[str, Dict[str, Any]]:
+    """Reciprocal Rank Fusion over two ranked id lists.
+
+    The core of the algorithm, in one place. The production retriever
+    (`_hybrid_fuse`) and the retrieval lab both call this, so there
+    is a single definition of how the two rankings are combined. When
+    there were two, the lab measured a slightly different system than
+    the one the product ran, and a change to one did not reach the
+    other.
+
+    Algorithm (Cormack et al. 2009): each ranker gives its hits a
+    1-based rank, and a chunk's fused score is the sum, over the
+    rankers that surfaced it, of `1 / (k + rank)`. A chunk that both
+    rankers like scores higher than one that only one of them did.
+
+    Args:
+        dense_ranked: chunk ids, best first.
+        sparse_ranked: chunk ids, best first.
+        k: the smoothing constant.
+
+    Returns:
+        `{chunk_id: {"score": rrf_score, "rank_dense": int|None,
+        "rank_sparse": int|None}}`.
+    """
+    fused: Dict[str, Dict[str, Any]] = {}
+
+    def _slot(cid: str) -> Dict[str, Any]:
+        slot = fused.get(cid)
+        if slot is None:
+            slot = {"score": 0.0, "rank_dense": None, "rank_sparse": None}
+            fused[cid] = slot
+        return slot
+
+    for rank, cid in enumerate(dense_ranked, start=1):
+        slot = _slot(cid)
+        slot["score"] += 1.0 / (k + rank)
+        slot["rank_dense"] = rank
+    for rank, cid in enumerate(sparse_ranked, start=1):
+        slot = _slot(cid)
+        slot["score"] += 1.0 / (k + rank)
+        slot["rank_sparse"] = rank
+    return fused
+
+
 def _hybrid_fuse(
     dense_hits: List[Dict[str, Any]],
     bm25_index: Any,
     query_text: str,
     top_k: int,
     sparse_top_k: int,
+    score_threshold: Optional[float] = None,
 ) -> List[Dict[str, Any]]:
     """Reciprocal Rank Fusion of dense + BM25 candidate lists.
 
@@ -390,6 +458,15 @@ def _hybrid_fuse(
             cannot add candidates that neither ranker surfaced.
         sparse_top_k: how many BM25 hits to pull. Defaults to
             `top_k` when the caller doesn't override.
+        score_threshold: the floor on vector similarity the caller
+            asked for. A BM25 score is not a cosine similarity and
+            cannot be compared with it, so a chunk that only BM25
+            surfaced has no similarity to test — and a chunk the dense
+            ranker never returned did not pass the floor. When a
+            threshold is set, such chunks are dropped: the caller's
+            threshold is a promise about the similarity of every
+            result, and a hit whose similarity is unknown, or known to
+            be below the floor, breaks it.
 
     Returns:
         The fused candidate list, sorted by RRF score descending,
@@ -425,25 +502,45 @@ def _hybrid_fuse(
         if cid:
             dense_by_chunk[str(cid)] = h
 
-    # RRF score accumulator. We use a dict of dicts so we can
-    # carry the original dense payload alongside the running score.
+    # The RRF scores themselves come from the shared implementation, so
+    # the lab and the product fuse the same way.
+    dense_ranked = [
+        str(h.get("chunk_id") or h.get("id") or "")
+        for h in dense_hits
+    ]
+    dense_ranked = [cid for cid in dense_ranked if cid]
+    sparse_ranked = [str(cid) for cid, _score, _meta in sparse_results]
+    scores = rrf_fuse(dense_ranked, sparse_ranked)
+
+    # We use a dict of dicts so we can carry the original dense
+    # payload alongside the running score.
     fused: Dict[str, Dict[str, Any]] = {}
 
-    for rank, h in enumerate(dense_hits, start=1):
+    for h in dense_hits:
         cid = str(h.get("chunk_id") or h.get("id") or "")
         if not cid:
             continue
+        slot = scores[cid]
         fused[cid] = {
             **h,
-            "_rrf_score": 1.0 / (RRF_K + rank),
-            "_rrf_rank_dense": rank,
+            "_rrf_score": slot["score"],
+            "_rrf_rank_dense": slot["rank_dense"],
         }
 
     for rank, (cid, _bm25_score, bm25_meta) in enumerate(sparse_results, start=1):
-        rrf_contrib = 1.0 / (RRF_K + rank)
+        slot = scores[str(cid)]
+        rrf_contrib = slot["score"]
         if cid in fused:
-            fused[cid]["_rrf_score"] = fused[cid].get("_rrf_score", 0.0) + rrf_contrib
-            fused[cid]["_rrf_rank_sparse"] = rank
+            fused[cid]["_rrf_score"] = rrf_contrib
+            fused[cid]["_rrf_rank_sparse"] = slot["rank_sparse"]
+        elif score_threshold is not None:
+            # A BM25-only hit, with a threshold in force. The dense
+            # ranker never returned this chunk, so it did not pass the
+            # caller's similarity floor — and BM25's score is not a
+            # similarity, so there is nothing to test it against.
+            # Returning it would break the promise the threshold
+            # makes.
+            continue
         else:
             # BM25-only hit — promote to a candidate. We prefer the
             # dense hit's payload (text, page_number, etc.) when
@@ -498,6 +595,7 @@ def _hybrid_fuse(
     for h in ranked[:top_k]:
         h2 = {k: v for k, v in h.items() if not k.startswith("_rrf_")}
         h2["score"] = float(h.get("_rrf_score", 0.0))
+        h2["score_type"] = SCORE_TYPE_RRF
         out.append(h2)
     return out
 
@@ -553,6 +651,7 @@ def _apply_rerank(query_text, candidates, top_k, reranker):
         out.append({
             "id": c.id,
             "score": float(c.score),
+            "score_type": SCORE_TYPE_RERANK,
             "text": c.text,
             "doc_id": orig.get("doc_id", ""),
             "chunk_id": orig.get("chunk_id", c.id),
@@ -609,6 +708,9 @@ def _resolve_parents(db, hits):
         out.append({
             "id": h.get("id"),
             "score": float(h.get("score", 0.0)),
+            # What the score means. Carried through, so a v1 hit and a
+            # v0 hit say the same thing about their score.
+            "score_type": h.get("score_type", SCORE_TYPE_COSINE),
             "text": h.get("text", ""),
             "doc_id": h.get("doc_id", ""),
             "chunk_id": h.get("chunk_id", h.get("id")),
@@ -630,6 +732,9 @@ def _with_v0_parent_defaults(h):
     return {
         "id": h.get("id"),
         "score": float(h.get("score", 0.0)),
+        # What the score means. Carried through, or the caller cannot
+        # tell a cosine similarity from an RRF score.
+        "score_type": h.get("score_type", SCORE_TYPE_COSINE),
         "text": h.get("text", ""),
         "doc_id": h.get("doc_id", ""),
         "chunk_id": h.get("chunk_id", h.get("id")),
