@@ -491,6 +491,77 @@ class TestQdrantV0InMemoryRoundtrip:
         assert hits[0]["is_parent"] is False
 
 
+class TestSqliteV1ParentChildRoundtrip:
+    """The same v1 roundtrip, against the *default* store.
+
+    The Qdrant roundtrip above passes because the Qdrant payload keeps
+    `text`. The SQLite store deliberately excludes `text` from the
+    payload (it is stored once, in its own column), so the SQLite
+    parent path is where a parent can come back empty. This is the
+    end-to-end version of that, on the backend the product ships with.
+    """
+
+    def _store(self, tmp_path):
+        from atrium.local_store import SqliteAdapter
+
+        return SqliteAdapter(path=str(tmp_path / "atrium_local.db"))
+
+    def test_parent_text_reaches_the_final_hit(self, tmp_path):
+        store = self._store(tmp_path)
+        store.ensure_collection("documents", dim=4)
+
+        parent_id = _uuid_str()
+        store.replace_chunks(
+            "d",
+            [
+                _make_v1_record(
+                    chunk_id=parent_id,
+                    is_parent=True,
+                    child_ids=[_uuid_str()],
+                    text="PARENT CONTEXT: the wide section this child came from",
+                ),
+                _make_v1_record(
+                    parent_id=parent_id,
+                    text="CHILD TEXT: the narrow piece that was retrieved",
+                ),
+            ],
+            "r1",
+        )
+
+        hits = retrieve_and_rerank(store, [0.5] * 4, query_text="", top_k=2)
+
+        assert hits, "expected at least one hit"
+        child_hits = [h for h in hits if h.get("parent_id")]
+        assert child_hits, "expected a child hit carrying a parent_id"
+
+        parent = child_hits[0]
+        assert parent["parent_text"], (
+            "parent_text was empty — the parent context never reached "
+            "the caller, which defeats the parent-child strategy"
+        )
+        assert "PARENT CONTEXT" in parent["parent_text"]
+
+    def test_parent_page_and_section_survive(self, tmp_path):
+        store = self._store(tmp_path)
+        store.ensure_collection("documents", dim=4)
+
+        parent_id = _uuid_str()
+        store.replace_chunks(
+            "d",
+            [
+                _make_v1_record(chunk_id=parent_id, is_parent=True, child_ids=[_uuid_str()]),
+                _make_v1_record(parent_id=parent_id),
+            ],
+            "r1",
+        )
+
+        hits = retrieve_and_rerank(store, [0.5] * 4, query_text="", top_k=2)
+        child_hits = [h for h in hits if h.get("parent_id")]
+        assert child_hits
+        assert child_hits[0]["parent_page_number"] == 1
+        assert child_hits[0]["parent_section_path"] == ["H1"]
+
+
 # ---------------------------------------------------------------------------
 # 5. PgVector upsert persists v1 metadata in payload
 # ---------------------------------------------------------------------------
