@@ -92,6 +92,15 @@ class RerankerAdapter(Protocol):
     candidate; only the order and (optionally) the `score` field
     change.
 
+    **A failure must RAISE, not return the input order.** The caller
+    cannot otherwise tell "the cross-encoder ranked these" from "the
+    cross-encoder was never asked": the returned candidates carry the
+    caller's original scores, so a returned list reads as a successful
+    ranking with plausible-looking numbers. `retrieve_and_rerank`
+    catches the exception and serves the vector ranking with
+    `reranked=False` — so the search still succeeds (fail open), but
+    the response tells the truth about what happened.
+
     `health()` is called at startup and on the `/health` endpoint so
     operators can see "reranker: ok / reranker: down" in the same
     probe that already reports DB and embedder status."""
@@ -186,13 +195,20 @@ class LocalBgeReranker:
                 convert_to_numpy=True,
             )
         except Exception as exc:
-            # If inference fails (OOM, truncated model file, etc.),
-            # fall back to the input order so the user still gets
-            # results. Log loudly — silent fallback would mask a
-            # real ops problem.
+            # Inference failed (OOM, truncated model file, etc.).
+            #
+            # This raises rather than returning the input order. A
+            # returned list is indistinguishable from a successful
+            # ranking: `retrieve_and_rerank` would report
+            # `reranked=True` and label the *original cosine* scores
+            # "rerank", so the API would tell the caller the
+            # cross-encoder ran when it did not. Raising lets the
+            # caller fall back to the vector order AND report
+            # `reranked=False` — the fail-open behaviour is kept, the
+            # lie is not.
             log.warning("Rerank inference failed (%s: %s); "
-                        "falling back to original order", type(exc).__name__, exc)
-            return candidates[:top_k]
+                        "falling back to vector order", type(exc).__name__, exc)
+            raise
 
         # Squash logits to [0, 1] so the score field is comparable
         # to vector-search scores. Sigmoid is the standard cross-
@@ -296,11 +312,16 @@ class FlashRankReranker:
         try:
             self._ensure_loaded()
             from flashrank import RerankRequest
-        except Exception:
-            # Model failed to load — fall back to original order
-            # so the caller still gets a result. Same fail-open
-            # contract as the BGE adapter.
-            return candidates[:top_k]
+        except Exception as exc:
+            # The model could not be loaded (or flashrank is not
+            # installed). Raise for the same reason the BGE adapter
+            # does: a returned list would be reported to the caller
+            # as a successful rerank, with the original cosine scores
+            # wearing a "rerank" label. `retrieve_and_rerank` catches
+            # this and serves the vector ranking with `reranked=False`.
+            log.warning("FlashRank unavailable (%s: %s); "
+                        "falling back to vector order", type(exc).__name__, exc)
+            raise
 
         # FlashRank mutates passage dicts in-place (assigns 'score'
         # then sorts by it). We pass {'id', 'text'} so we can map the
@@ -313,10 +334,12 @@ class FlashRankReranker:
                 RerankRequest(query=query, passages=passages),
             )
         except Exception as exc:
+            # The rerank call failed. Raise — see the note in
+            # `LocalBgeReranker.rerank`: returning the input order
+            # would be reported to the caller as a successful rerank.
             log.warning("FlashRank rerank call failed (%s: %s); "
-                        "falling back to original order",
-                        type(exc).__name__, exc)
-            return candidates[:top_k]
+                        "falling back to vector order", type(exc).__name__, exc)
+            raise
 
         # Re-key candidates by id for O(1) lookup, then emit RerankCandidate
         # objects preserving the original payload.
@@ -401,9 +424,12 @@ class CohereReranker:
                 return_documents=False,
             )
         except Exception as exc:
+            # The Cohere call failed. Raise — see the note in
+            # `LocalBgeReranker.rerank`: returning the input order
+            # would be reported to the caller as a successful rerank.
             log.warning("Cohere rerank failed (%s: %s); "
-                        "falling back to original order", type(exc).__name__, exc)
-            return candidates[:top_k]
+                        "falling back to vector order", type(exc).__name__, exc)
+            raise
         out = []
         for hit in response.results:
             idx = hit.index
@@ -440,9 +466,12 @@ class CohereReranker:
             )
             response.raise_for_status()
         except Exception as exc:
+            # The Cohere HTTP call failed. Raise — see the note in
+            # `LocalBgeReranker.rerank`: returning the input order
+            # would be reported to the caller as a successful rerank.
             log.warning("Cohere HTTP rerank failed (%s: %s); "
-                        "falling back to original order", type(exc).__name__, exc)
-            return candidates[:top_k]
+                        "falling back to vector order", type(exc).__name__, exc)
+            raise
 
         data = response.json()
         out = []
