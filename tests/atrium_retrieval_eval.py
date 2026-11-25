@@ -34,16 +34,15 @@ sys.path.insert(0, "/Users/yashsolanki/Desktop/atrium-rag")
 EV = Path("/Users/yashsolanki/Desktop/rag-ingest/eval_v2")
 ROOT = EV.parent
 
-from eval_v2.common import build_embedder
-from eval_v2.core.canonical import CanonicalDoc
-from eval_v2.core.types import Block, Chunk, Passage, Question
-from eval_v2.questions.generate import read_questions
-from eval_v2.runner import Index, _embed_in_batches, _resolve_path
-from eval_v2.corpus.manifest import read_manifest
-from eval_v2.core.align import merge_intervals
-from eval_v2.core.aligning import align_blocks
 from eval_v2.adapters.base import get_adapter
 from eval_v2.chunking import ChunkOptions
+from eval_v2.common import build_embedder
+from eval_v2.core.align import merge_intervals
+from eval_v2.core.aligning import align_blocks
+from eval_v2.core.types import Passage
+from eval_v2.corpus.manifest import read_manifest
+from eval_v2.questions.generate import read_questions
+from eval_v2.runner import Index, _embed_in_batches, _resolve_path
 
 
 class CachingEmbedder:
@@ -132,11 +131,10 @@ class AtriumRetriever:
 def build_atrium_index(doc_ids, embedder, chunker="native", mode="hybrid",
                        top_k=10, candidate_k=50, use_reranker=False):
     """The corpus, chunked and embedded, indexed in a real SqliteAdapter."""
+    import tempfile
+
     from atrium.local_store import SqliteAdapter
     from atrium.models import ChunkRecord, SourceMetadata
-    from atrium.smart_chunker import chunk_with_mode
-    from atrium.universal_parser import UniversalParser
-    import tempfile
 
     specs = {s.doc_id: s for s in read_manifest(EV / "corpus_manifest.csv")}
     adapter = get_adapter("ours")
@@ -144,7 +142,6 @@ def build_atrium_index(doc_ids, embedder, chunker="native", mode="hybrid",
     index = Index(system="ours", chunker=chunker)
     db = SqliteAdapter(os.path.join(tempfile.mkdtemp(), "atrium.db"))
     records = []
-    seen = 0
 
     for doc_id in doc_ids:
         spec = specs.get(doc_id)
@@ -325,7 +322,7 @@ def main():
             r5 = sum(1 for r in rs if r.get("recall_at_5")) / max(1, len(rs))
             r10 = sum(1 for r in rs if r.get("recall_at_10")) / max(1, len(rs))
             rows.append((d["n"] - d["labels"].get("NO_ANSWER_ERROR", 0), doc_id, d, r5, r10))
-        for loss, doc_id, d, r5, r10 in sorted(rows, reverse=True):
+        for _loss, doc_id, d, r5, r10 in sorted(rows, reverse=True):
             labels = {k: v for k, v in d["labels"].items()
                       if k not in ("NO_ANSWER_ERROR",)}
             print(f"  {doc_id:30} {d['n']:4} {r5:7.2f} {r10:7.2f}  {labels}")
@@ -334,7 +331,7 @@ def main():
         # The harness's own retriever, on the SAME chunks and the SAME
         # questions. The difference between the two numbers is the
         # retrieval code and nothing else.
-        from eval_v2.retrieval.pipeline import Retriever, RetrievalConfig
+        from eval_v2.retrieval.pipeline import RetrievalConfig, Retriever
         from eval_v2.runner import _embed_in_batches
         cfg = RetrievalConfig(top_k=10, candidate_k=50, mode=args.mode)
         vectors = _embed_in_batches(
