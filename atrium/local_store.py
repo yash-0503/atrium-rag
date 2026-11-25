@@ -628,8 +628,13 @@ class SqliteAdapter:
             return {}
         conn = self._connect()
         placeholders = ",".join("?" for _ in parent_ids)
+        # The `text` column is selected explicitly. The payload
+        # deliberately excludes `text` (see `_row` — it is stored once,
+        # in the column, not twice), so reading the text from the
+        # payload returned "" for every parent. The payload is kept as
+        # a fallback for a row written before the column existed.
         rows = conn.execute(
-            f"SELECT chunk_id, payload FROM chunks WHERE chunk_id IN ({placeholders})",
+            f"SELECT chunk_id, text, payload FROM chunks WHERE chunk_id IN ({placeholders})",
             list(parent_ids),
         ).fetchall()
         parents: Dict[str, Dict[str, Any]] = {}
@@ -638,7 +643,7 @@ class SqliteAdapter:
             page_number, section_path = source_fields(payload)
             parents[row["chunk_id"]] = {
                 "id": row["chunk_id"],
-                "text": payload.get("text", ""),
+                "text": row["text"] or payload.get("text", ""),
                 "doc_id": payload.get("doc_id", ""),
                 "chunk_id": row["chunk_id"],
                 "page_number": page_number,

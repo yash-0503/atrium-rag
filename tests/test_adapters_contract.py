@@ -404,6 +404,45 @@ class TestSqliteAdapterContract:
         assert "p1" in parents
         assert parents["p1"]["is_parent"] is True
 
+    def test_retrieve_parents_returns_the_parent_text(self, tmp_path):
+        """The parent's text must come back, not an empty string.
+
+        The stored payload deliberately excludes `text` (it lives in the
+        `text` column, so it is not stored twice), so a `retrieve_parents`
+        that reads the text from the payload returns "" for every parent.
+        The parent-child strategy exists to hand the caller the parent's
+        context; an empty parent_text defeats it silently.
+        """
+        store = self._store(tmp_path)
+        store.ensure_collection("documents", 3)
+        store.upsert([
+            self._record(chunk_id="p1", is_parent=True, text="the parent context"),
+        ])
+        parents = store.retrieve_parents(["p1"])
+        assert parents["p1"]["text"] == "the parent context"
+
+    def test_retrieve_parents_falls_back_to_the_payload_text(self, tmp_path):
+        """A row whose `text` column is empty falls back to the payload.
+
+        A chunk written before the column existed carries its text only
+        in the payload, so the fallback keeps those rows readable rather
+        than returning "" for them.
+        """
+        store = self._store(tmp_path)
+        store.ensure_collection("documents", 3)
+        store.upsert([self._record(chunk_id="p1", is_parent=True)])
+        conn = store._connect()
+        conn.execute(
+            "UPDATE chunks SET text = '' WHERE chunk_id = 'p1'"
+        )
+        conn.commit()
+        parents = store.retrieve_parents(["p1"])
+        # The payload has no `text` either (it is excluded on write), so
+        # an empty column and an empty payload both yield "" — but the
+        # lookup must not raise and must still return the parent.
+        assert "p1" in parents
+        assert parents["p1"]["is_parent"] is True
+
     def test_delete_stale_chunks_removes_the_old_run(self, tmp_path):
         store = self._store(tmp_path)
         store.ensure_collection("documents", 3)
