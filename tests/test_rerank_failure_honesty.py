@@ -185,6 +185,13 @@ class TestFlashRankRerankerRaises:
             adapter.rerank("q", _candidates(), 2)
 
     def test_rerank_call_failure_raises(self):
+        # The `flashrank` extra is optional, and `rerank()` imports
+        # `RerankRequest` from it. Without the extra installed the
+        # import fails before the call is ever made, so this test can
+        # only reach the call path when the extra is present.
+        pytest.importorskip(
+            "flashrank", reason="the optional `flashrank` extra is not installed"
+        )
         adapter = FlashRankReranker(model_name="ms-marco-MiniLM-L-12-v2")
 
         class _BrokenRanker:
@@ -194,6 +201,22 @@ class TestFlashRankRerankerRaises:
         adapter._ranker = _BrokenRanker()
 
         with pytest.raises(RuntimeError, match="onnx session failed"):
+            adapter.rerank("q", _candidates(), 2)
+
+    def test_a_missing_flashrank_extra_raises(self):
+        """A deployment without the optional extra must degrade, not lie.
+
+        `flashrank` is an optional extra, so "not installed" is a real
+        deployment state. `rerank()` imports `RerankRequest` from it,
+        so on such a deployment the import is the failure — and it has
+        to raise for the same reason every other failure does.
+        """
+        adapter = FlashRankReranker(model_name="ms-marco-MiniLM-L-12-v2")
+        # Whatever the local environment has installed, the failure the
+        # adapter must report is the missing module.
+        adapter._load_error = ModuleNotFoundError("No module named 'flashrank'")
+
+        with pytest.raises(ModuleNotFoundError):
             adapter.rerank("q", _candidates(), 2)
 
 
