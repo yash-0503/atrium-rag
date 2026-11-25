@@ -609,6 +609,15 @@ def _apply_rerank(query_text, candidates, top_k, reranker):
     cross-encoder actually scored these results. The caller reports it
     to the API, so a reranker that failed must not be reported as
     though it worked.
+
+    A failure is an **exception** from the adapter, not a returned
+    list. The adapters are required to raise (see the
+    `RerankerAdapter` protocol): a returned list carries the
+    caller's original scores and is indistinguishable from a ranking
+    that actually happened, so it would be reported as
+    `reranked=True` with cosine scores wearing a "rerank" label. The
+    exception is caught here, the search still succeeds, and
+    `reranked=False` tells the truth.
     """
     # Lazy import: rerank_adapter is heavy (it pulls sentence-transformers
     # for the local model); the /search path without rerank shouldn't
@@ -638,6 +647,10 @@ def _apply_rerank(query_text, candidates, top_k, reranker):
         # cross-encoder picks from it, and the parent dedup needs the
         # extra breadth to survive collapsing many children into one
         # parent. The caller truncates the final list to top_k.
+        #
+        # `score_type` is left as the dense stage set it, so a caller
+        # reading these scores knows they are cosine (or RRF) values
+        # and not cross-encoder values.
         out = list(candidates)
         out.sort(key=lambda h: h.get("score", 0.0), reverse=True)
         return out, False
