@@ -150,6 +150,17 @@ DEFAULTS: Dict[str, str] = {
     "DEFAULT_TOP_K": "8",
     "DENSE_CONFIDENT_GAP": "0.05",
     "DENSE_MIN_SCORE": "0.55",
+    # Hybrid (dense + BM25/RRF) retrieval. On by default: the sparse
+    # ranking is consulted only when the confidence gate says the
+    # dense result is uncertain, so a confident dense answer is served
+    # unchanged. Set to 0 to serve dense-only.
+    "HYBRID_ENABLED": "1",
+    # How long the cached lexical index may serve text that is no
+    # longer in the corpus. A document replaced in place (same chunk
+    # count, new content) is picked up within this window; an added
+    # or removed document is picked up immediately, because the chunk
+    # count changes.
+    "BM25_INDEX_TTL_SECONDS": "60",
     # -- HTTP / security ---------------------------------------------------
     "API_KEY": "",
     "MAX_UPLOAD_BYTES": str(100 * 1024 * 1024),
