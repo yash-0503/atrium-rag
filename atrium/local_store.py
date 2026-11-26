@@ -533,6 +533,44 @@ class SqliteAdapter:
     # The name the protocol uses.
     chunk_count = count_chunks
 
+    def list_chunks(self) -> List[Dict[str, Any]]:
+        """Every chunk in the corpus, in the shared `list_chunks` shape.
+
+        This is a full corpus read — it exists so the lexical (BM25)
+        index can be built from the store rather than maintained
+        alongside it. It is called when the index is (re)built, not on
+        the search path.
+
+        The `text` column is selected alongside the payload because
+        the payload deliberately excludes `text` (it is stored once, in
+        the column) — the same reason `retrieve_parents` reads the
+        column rather than the payload.
+        """
+        conn = self._connect()
+        rows = conn.execute(
+            "SELECT chunk_id, doc_id, text, payload, element_type, is_parent,"
+            " page_number, section_path FROM chunks"
+        ).fetchall()
+        out: List[Dict[str, Any]] = []
+        for row in rows:
+            payload = _safe_json(row["payload"])
+            page_number, section_path = source_fields(payload)
+            stored_section = _decode_section_path(row["section_path"])
+            out.append({
+                "chunk_id": row["chunk_id"],
+                "doc_id": row["doc_id"] or "",
+                "text": row["text"] or "",
+                "page_number": (
+                    row["page_number"] if row["page_number"] is not None else page_number
+                ),
+                "section_path": stored_section or section_path,
+                "element_type": row["element_type"] or payload.get("element_type", ""),
+                "is_parent": bool(row["is_parent"]),
+                "parent_id": payload.get("parent_id"),
+                "chunking_strategy": payload.get("chunking_strategy", ""),
+            })
+        return out
+
 
     def _search(
         self,

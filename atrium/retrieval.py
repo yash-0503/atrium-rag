@@ -125,6 +125,7 @@ def collection_schema_version(db) -> int:
 def _should_consult_bm25(
     candidates: List[Dict[str, Any]],
     bm25_index: Optional[Any],
+    query_text: str = "",
 ) -> bool:
     """Confidence-gate heuristic for the 2026-10-18 hybrid opt-in.
 
@@ -136,6 +137,13 @@ def _should_consult_bm25(
     Cases:
       - No `bm25_index` supplied → False (dense-only; cannot consult
         what isn't there).
+      - The query is written in a script the sparse tokenizer cannot
+        segment (Han / Kana / Hangul) → False. The BM25 tokenizer
+        treats a run of Han characters as one opaque token, so the
+        sparse ranker is effectively blind to those documents. Fusing
+        a blind signal into a good dense ranking can only dilute it,
+        so the sparse half is skipped for such a query. See
+        `atrium.bm25.contains_cjk`.
       - Zero candidates → True (no dense answer, BM25 is the only
         hope; `_hybrid_fuse` handles the empty-dense case).
       - One candidate → True. A single result has no defined
@@ -153,6 +161,8 @@ def _should_consult_bm25(
     """
     if bm25_index is None:
         return False
+    if query_text and _is_cjk_query(query_text):
+        return False
     if not candidates:
         return True
     if len(candidates) == 1:
@@ -164,6 +174,18 @@ def _should_consult_bm25(
     gap = top1 - top2
     confident = (gap >= DENSE_CONFIDENT_GAP) and (top1 >= DENSE_MIN_SCORE)
     return not confident
+
+
+def _is_cjk_query(query_text: str) -> bool:
+    """Is this query written in a script the sparse tokenizer can't read?
+
+    Kept as a thin wrapper so the retrieval layer does not import the
+    BM25 module at module scope — `atrium.bm25` is cheap, but the
+    import graph here is deliberately lazy about the retrieval stack.
+    """
+    from atrium.bm25 import contains_cjk
+
+    return contains_cjk(query_text)
 
 
 def retrieve_and_rerank(
@@ -291,8 +313,13 @@ def retrieve_and_rerank(
     # heuristic; a misfire routes to the wrong ranker but does not
     # drop hits. Logging below records the decision for
     # post-hoc analysis.
+    #
+    # `hybrid_applied` says whether the sparse ranking actually
+    # contributed to the results — it is reported to the caller, so
+    # "dense-only" is never passed off as a hybrid result.
+    hybrid_applied = False
     if bm25_index is not None:
-        should_consult = _should_consult_bm25(raw_candidates, bm25_index)
+        should_consult = _should_consult_bm25(raw_candidates, bm25_index, query_text)
         if raw_candidates:
             top1 = float(raw_candidates[0].get("score", 0.0))
             top2 = (
@@ -315,11 +342,16 @@ def retrieve_and_rerank(
         if should_consult:
             bm25_top = bm25_candidate_k or cand_k
             try:
-                raw_candidates = _hybrid_fuse(
+                fused = _hybrid_fuse(
                     raw_candidates, bm25_index, query_text, top_k=cand_k,
                     sparse_top_k=bm25_top,
                     score_threshold=score_threshold,
                 )
+                raw_candidates = fused
+                # The fusion ran. It may still have returned the dense
+                # list unchanged (the sparse ranker matched nothing),
+                # but the RRF path is what produced these candidates.
+                hybrid_applied = True
             except Exception as exc:
                 # Graceful fallback: BM25 raised (tokenization error,
                 # corpus mismatch, etc.) — continue with the dense
@@ -375,6 +407,13 @@ def retrieve_and_rerank(
         stats["reranked"] = reranked
         stats["candidate_count"] = len(raw_candidates)
         stats["returned_count"] = len(hits)
+        # Whether the sparse (BM25) ranking actually contributed. The
+        # gate may decline to consult it (a confident dense result, or
+        # a query the sparse tokenizer cannot read), and the fusion may
+        # fail — in both cases the results are dense-only and the
+        # caller should be told, the same way `reranked` reports
+        # whether the cross-encoder ran.
+        stats["hybrid"] = hybrid_applied
 
     return hits
 
