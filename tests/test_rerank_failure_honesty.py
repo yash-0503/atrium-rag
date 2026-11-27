@@ -291,6 +291,8 @@ class TestSearchEndpointReportsTheFailure:
         from atrium.job_store import JobStore
         from atrium.main import app
 
+        monkeypatch.setenv("HYBRID_ENABLED", "0")
+
         embedder = MagicMock()
         embedder.embed.return_value = [[0.0] * 8]
         embedder.dimension = 8
