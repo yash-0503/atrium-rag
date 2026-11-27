@@ -348,10 +348,6 @@ class TestSearchEndpointReportsTheFailure:
         assert body["rerank_available"] is True
         assert body["results"], "the search returned nothing"
         for hit in body["results"]:
-            # The cross-encoder did not run, so no score may be
-            # labelled as a cross-encoder score. The score type may
-            # legitimately be "cosine" or "rrf" — depending on whether
-            # the hybrid fusion ran — but it must never be "rerank".
-            assert hit["score_type"] != "rerank", (
-                "a failed rerank must not label scores as rerank scores"
+            assert hit["score_type"] == "cosine", (
+                "a failed rerank must not label cosine scores as rerank scores"
             )
