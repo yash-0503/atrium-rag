@@ -29,6 +29,12 @@ Cohere if the env says so.
 
 The Protocol is intentionally minimal so users can write their own
 adapter (e.g. Jina, mixedbread, custom fine-tuned CrossEncoder).
+
+Failure contract: a reranker that fails MUST raise. It must never
+return the input order as a fallback, because that list is
+indistinguishable from a real ranking. `retrieve_and_rerank` is the
+single place that catches the exception, serves the vector ranking
+(fail-open) and reports `reranked=False`.
 """
 
 from __future__ import annotations
@@ -91,6 +97,11 @@ class RerankerAdapter(Protocol):
     `id`, `text`, `score`, and `payload` fields on each returned
     candidate; only the order and (optionally) the `score` field
     change.
+
+    Implementations MUST raise if reranking fails. Never return the
+    input order as a fallback: it is indistinguishable from a real
+    ranking. The caller (`retrieve_and_rerank`) owns the fail-open
+    behaviour.
 
     `health()` is called at startup and on the `/health` endpoint so
     operators can see "reranker: ok / reranker: down" in the same
@@ -186,13 +197,14 @@ class LocalBgeReranker:
                 convert_to_numpy=True,
             )
         except Exception as exc:
-            # If inference fails (OOM, truncated model file, etc.),
-            # fall back to the input order so the user still gets
-            # results. Log loudly — silent fallback would mask a
-            # real ops problem.
-            log.warning("Rerank inference failed (%s: %s); "
-                        "falling back to original order", type(exc).__name__, exc)
-            return candidates[:top_k]
+            # Inference failed (OOM, truncated model file, etc.).
+            # Do NOT return the input order: it looks like a real
+            # ranking and carries the caller's cosine scores. Raise
+            # so retrieve_and_rerank can fail open and report
+            # reranked=False. Log loudly — this is a real ops problem.
+            log.warning("Rerank inference failed (%s: %s)",
+                        type(exc).__name__, exc)
+            raise
 
         # Squash logits to [0, 1] so the score field is comparable
         # to vector-search scores. Sigmoid is the standard cross-
@@ -293,14 +305,12 @@ class FlashRankReranker:
         if not candidates:
             return []
         top_k = min(top_k, len(candidates))
-        try:
-            self._ensure_loaded()
-            from flashrank import RerankRequest
-        except Exception:
-            # Model failed to load — fall back to original order
-            # so the caller still gets a result. Same fail-open
-            # contract as the BGE adapter.
-            return candidates[:top_k]
+
+        # Load and import failures propagate (including a missing
+        # `flashrank` extra, which raises ModuleNotFoundError).
+        # retrieve_and_rerank is the one place that fails open.
+        self._ensure_loaded()
+        from flashrank import RerankRequest
 
         # FlashRank mutates passage dicts in-place (assigns 'score'
         # then sorts by it). We pass {'id', 'text'} so we can map the
@@ -313,10 +323,9 @@ class FlashRankReranker:
                 RerankRequest(query=query, passages=passages),
             )
         except Exception as exc:
-            log.warning("FlashRank rerank call failed (%s: %s); "
-                        "falling back to original order",
+            log.warning("FlashRank rerank call failed (%s: %s)",
                         type(exc).__name__, exc)
-            return candidates[:top_k]
+            raise
 
         # Re-key candidates by id for O(1) lookup, then emit RerankCandidate
         # objects preserving the original payload.
@@ -401,9 +410,9 @@ class CohereReranker:
                 return_documents=False,
             )
         except Exception as exc:
-            log.warning("Cohere rerank failed (%s: %s); "
-                        "falling back to original order", type(exc).__name__, exc)
-            return candidates[:top_k]
+            log.warning("Cohere rerank failed (%s: %s)",
+                        type(exc).__name__, exc)
+            raise
         out = []
         for hit in response.results:
             idx = hit.index
@@ -440,9 +449,9 @@ class CohereReranker:
             )
             response.raise_for_status()
         except Exception as exc:
-            log.warning("Cohere HTTP rerank failed (%s: %s); "
-                        "falling back to original order", type(exc).__name__, exc)
-            return candidates[:top_k]
+            log.warning("Cohere HTTP rerank failed (%s: %s)",
+                        type(exc).__name__, exc)
+            raise
 
         data = response.json()
         out = []
