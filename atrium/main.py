@@ -3,6 +3,7 @@ import base64
 import logging
 import os
 import sys
+import threading
 import time
 import uuid
 from collections import OrderedDict
@@ -17,6 +18,7 @@ from pydantic import BaseModel, Field
 # Import the existing embedder and DB adapters
 from atrium.adapters import build_store
 from atrium.config import data_path, env_bool, env_float, env_int, env_str
+from atrium.corpus_index import CorpusBm25Index
 from atrium.embedder_config import build_embedder, default_base_url
 from atrium.errors import AtriumSetupError
 from atrium.job_store import JobStore
@@ -205,6 +207,45 @@ def _get_db():
     if override is not None:
         return override
     return _build_db()
+
+
+# The lexical (BM25) index over the corpus, for the hybrid search
+# path. It is a cache over the corpus, rebuilt when the corpus
+# changes; see `atrium.corpus_index` for the rules. Held per store
+# adapter, because the index is built from one store's chunks.
+_bm25_indexes: dict = {}
+_bm25_indexes_guard = threading.Lock()
+
+
+def _get_bm25_index():
+    """The lexical index for the current store, or None.
+
+    One index per store adapter: the index is built from that
+    adapter's chunks, so a test that swaps the store must not keep
+    reading an index built from the previous one.
+    """
+    db = _get_db()
+    key = id(db)
+    with _bm25_indexes_guard:
+        index = _bm25_indexes.get(key)
+        if index is None:
+            index = CorpusBm25Index(db)
+            _bm25_indexes[key] = index
+        return index
+
+
+def _invalidate_bm25_index() -> None:
+    """The corpus changed under us — drop the cached lexical index.
+
+    Called after an ingest in this process, so a document that was
+    just ingested is searchable by the sparse ranker immediately
+    rather than after the TTL.
+    """
+    db = _get_db()
+    with _bm25_indexes_guard:
+        index = _bm25_indexes.get(id(db))
+    if index is not None:
+        index.invalidate()
 
 
 def __getattr__(name: str):
@@ -574,6 +615,28 @@ async def search(body: SearchRequest):
         log.warning("search embed failed: %s", exc)
         raise HTTPException(503, f"Embedder unavailable: {_explain(exc)}") from exc
 
+    # The lexical (BM25) half of the hybrid path. The index is built
+    # from the corpus on demand and cached; `retrieve_and_rerank`
+    # decides whether to consult it (the confidence gate).
+    #
+    # A query written in a script the sparse tokenizer cannot segment
+    # (Han / Kana / Hangul) does not get a lexical index at all: the
+    # sparse ranker is blind to those documents, so consulting it
+    # would dilute the dense ranking rather than help it. The index
+    # is not even built for such a query — building it is a full
+    # corpus read, and it would be thrown away.
+    bm25_index = None
+    if env_bool("HYBRID_ENABLED", True):
+        from atrium.bm25 import contains_cjk
+
+        if not contains_cjk(query):
+            try:
+                bm25_index = await asyncio.to_thread(_get_bm25_index().get)
+            except Exception as exc:
+                log.warning("lexical index unavailable (%s: %s); "
+                            "serving the dense ranking", type(exc).__name__, exc)
+                bm25_index = None
+
     # The stats dict is how the response learns what actually happened.
     # A reranker that was configured but then failed leaves
     # `reranked` False, and the response says so rather than claiming
@@ -589,6 +652,7 @@ async def search(body: SearchRequest):
             reranker=reranker,
             candidate_k=body.candidate_k,
             score_threshold=body.score_threshold,
+            bm25_index=bm25_index,
             stats=stats,
         )
     except Exception as exc:
@@ -640,6 +704,13 @@ async def search(body: SearchRequest):
         # Whether these results were actually reranked — not whether a
         # reranker happened to be configured.
         "rerank": reranked,
+        # Whether the sparse (BM25) ranking contributed to these
+        # results. `False` means the results are dense-only: the
+        # confidence gate declined to consult the lexical index, the
+        # query was in a script the sparse tokenizer cannot read, or
+        # the fusion failed. `score_type` on each hit says the same
+        # thing from the other side ("rrf" vs "cosine").
+        "hybrid": bool(stats.get("hybrid", False)),
         # The score type of every result, so the caller does not have
         # to read it off the first hit.
         "score_type": (results[0].get("score_type") if results else "cosine"),
@@ -716,6 +787,10 @@ async def _run_one_ingestion(
         # A dependency that is missing, a document that will not parse,
         # or anything else — each with the status that says which.
         raise _ingest_failure(exc) from exc
+    # The corpus changed: drop the cached lexical index so the document
+    # that was just ingested is searchable by the sparse ranker
+    # immediately, not after the TTL.
+    _invalidate_bm25_index()
     record = job_store.get(job_id) or {}
     return {
         "job_id": job_id,

@@ -129,6 +129,8 @@ omitted follows `RERANK_ENABLED`.
   "query": "retention policy",
   "top_k": 8,
   "rerank": false,
+  "hybrid": true,
+  "score_type": "rrf",
   "count": 8,
   "corpus_chunks": 1451,
   "took_ms": 41,
@@ -145,6 +147,11 @@ omitted follows `RERANK_ENABLED`.
 
 Every result carries where it came from: the page, the heading path, the
 element type and the chunking strategy that produced it.
+
+`hybrid` says whether the sparse (BM25) ranking contributed to these
+results; `score_type` says what the `score` numbers mean — `"rrf"` for
+a fused result, `"cosine"` for a dense-only one, `"rerank"` for a
+cross-encoder score.
 
 ### `POST /jobs`
 
@@ -221,6 +228,8 @@ list, with comments, is in `.env.example`.
 | `EMBED_MODEL` | `bge-large` | Model name, as that endpoint knows it |
 | `EMBED_DIM` | `1024` | Must match the model's dimension |
 | `DEFAULT_TOP_K` | `8` | Results returned by `/search` |
+| `HYBRID_ENABLED` | `1` | Fuse the sparse (BM25) ranking with the dense one |
+| `BM25_INDEX_TTL_SECONDS` | `60` | How long the cached lexical index may be stale |
 | `OCR_ENABLED` | `0` | OCR for scanned pages |
 | `OCR_PROVIDER` | `tesseract` | `tesseract` or `rapidocr` |
 | `OCR_LANG` | `eng` | Language code |
@@ -335,10 +344,19 @@ The difference against Docling is inside the confidence interval; the
 separation is in cost — atrium parses the corpus in a sixth of the time
 and a third of the memory.
 
-`POST /search` answers with **dense retrieval** today: the same corpus,
-the same embedding model, **0.655 R@5**. The 0.700 above is the same
-system with the sparse ranker fused in, which is the configuration the
-benchmark measured and the one the corpus endpoint is being moved to.
+`POST /search` runs **hybrid retrieval**: the dense ranking, plus a
+sparse BM25 ranking fused with it by reciprocal rank fusion. The sparse
+ranking is consulted only when the dense result is *uncertain* — a
+wide gap between the top two hits and a high top score means the dense
+ranking is confident and it is left alone. Set `HYBRID_ENABLED=0` to
+serve dense-only.
+
+The response says which of the two you got: `hybrid` is `true` when the
+sparse ranking contributed, and every hit's `score_type` reads `"rrf"`
+for a fused result and `"cosine"` for a dense-only one.
+
+The 0.700 above is that configuration. The dense ranking alone scores
+**0.655 R@5** on the same corpus with the same embedding model.
 
 The harness, the corpus and the exact commands are published in the
 [`atrium-benchmarks`](https://github.com/yash-0503/atrium-benchmarks)
@@ -361,8 +379,14 @@ Worth knowing before you rely on it:
   scanned page comes back empty.
 - **The local store scans every vector on every query.** It is the
   right tool up to roughly twenty thousand chunks.
-- **Retrieval is dense-only in the corpus endpoint.** The sparse
-  ranker exists and is measured; it is not wired into `/search` yet.
+- **The sparse ranker cannot read Chinese, Japanese or Korean.** Its
+  tokenizer treats a run of Han characters as one token, so a query
+  written in those scripts is served by the dense ranking alone. This
+  is deliberate: the sparse ranker would be blind to those documents,
+  and fusing a blind signal into a good dense ranking only dilutes it.
+- **A document re-ingested with the same number of chunks is picked
+  up by the sparse ranker within `BM25_INDEX_TTL_SECONDS`** (60 by
+  default). An added or removed document is picked up at once.
 - **There is no distributed job queue.** Workers share one SQLite file.
 - **The reranker is opt-in.** It helps most corpora and hurts forms,
   slides, math and OCR'd scans, so it stays off until you ask for it.

@@ -9,6 +9,7 @@ Embedding and vector-DB adapters behind small protocols. Implementations:
   pipeline code.
 """
 
+import json
 from contextlib import contextmanager
 from typing import Any, Dict, List, Optional, Protocol
 
@@ -134,6 +135,7 @@ class VectorDBAdapter(Protocol):
         batch_size: int = 100,
     ) -> None: ...
     def count_chunks(self) -> int: ...
+    def list_chunks(self) -> List[Dict[str, Any]]: ...
     def close(self) -> None: ...
     def health(self) -> bool: ...
     def collection_schema_version(self) -> int: ...
@@ -447,6 +449,43 @@ class QdrantAdapter:
         except Exception:
             return 0
 
+    def list_chunks(self) -> List[Dict[str, Any]]:
+        """Every chunk in the corpus, in the shared `list_chunks` shape.
+
+        A full corpus read — it exists so the lexical (BM25) index can
+        be built from the store rather than maintained alongside it.
+        It is called when the index is (re)built, not on the search
+        path. Scrolling is paged so a large collection does not have
+        to be held in one response.
+        """
+        out: List[Dict[str, Any]] = []
+        offset = None
+        while True:
+            points, offset = self.client.scroll(
+                collection_name="documents",
+                limit=512,
+                offset=offset,
+                with_payload=True,
+                with_vectors=False,
+            )
+            for p in points:
+                payload = p.payload or {}
+                page_number, section_path = source_fields(payload)
+                out.append({
+                    "chunk_id": str(payload.get("chunk_id") or p.id),
+                    "doc_id": payload.get("doc_id", "") or "",
+                    "text": payload.get("text", "") or "",
+                    "page_number": page_number,
+                    "section_path": section_path,
+                    "element_type": payload.get("element_type", ""),
+                    "is_parent": bool(payload.get("is_parent", False)),
+                    "parent_id": payload.get("parent_id"),
+                    "chunking_strategy": payload.get("chunking_strategy", ""),
+                })
+            if offset is None:
+                break
+        return out
+
     def close(self) -> None:
         """Release the client's connections."""
         close = getattr(self.client, "close", None)
@@ -685,6 +724,35 @@ class PgVectorAdapter:
                 return int(row[0]) if row else 0
         except Exception:
             return 0
+
+    def list_chunks(self) -> List[Dict[str, Any]]:
+        """Every chunk in the corpus, in the shared `list_chunks` shape.
+        """
+        out: List[Dict[str, Any]] = []
+        with self.pool.connection() as conn:
+            rows = conn.execute(
+                "SELECT chunk_id, doc_id, payload FROM chunks"
+            ).fetchall()
+        for row in rows:
+            payload = row["payload"]
+            if not isinstance(payload, dict):
+                try:
+                    payload = json.loads(payload or "{}")
+                except (ValueError, TypeError):
+                    payload = {}
+            page_number, section_path = source_fields(payload)
+            out.append({
+                "chunk_id": str(row["chunk_id"]),
+                "doc_id": row["doc_id"] or "",
+                "text": payload.get("text", "") or "",
+                "page_number": page_number,
+                "section_path": section_path,
+                "element_type": payload.get("element_type", ""),
+                "is_parent": bool(payload.get("is_parent", False)),
+                "parent_id": payload.get("parent_id"),
+                "chunking_strategy": payload.get("chunking_strategy", ""),
+            })
+        return out
 
     def close(self) -> None:
         """Close the connection pool.

@@ -29,6 +29,12 @@ Cohere if the env says so.
 
 The Protocol is intentionally minimal so users can write their own
 adapter (e.g. Jina, mixedbread, custom fine-tuned CrossEncoder).
+
+Failure contract: a reranker that fails MUST raise. It must never
+return the input order as a fallback, because that list is
+indistinguishable from a real ranking. `retrieve_and_rerank` is the
+single place that catches the exception, serves the vector ranking
+(fail-open) and reports `reranked=False`.
 """
 
 from __future__ import annotations
